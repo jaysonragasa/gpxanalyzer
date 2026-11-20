@@ -20,6 +20,7 @@ import {
   exportSceneToBinaryStl,
   fetchMap3DTerrainAndTextures,
   Terrain3DOptions,
+  TrackStyle3D,
 } from '../utils/terrain3d';
 
 interface GpxTo3DModalProps {
@@ -41,6 +42,9 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
   const [baseThicknessMm, setBaseThicknessMm] = useState<number>(6);
   const [trackWidthMm, setTrackWidthMm] = useState<number>(2.2);
   const [trackHeightMm, setTrackHeightMm] = useState<number>(1.8);
+  const [trackStyle, setTrackStyle] = useState<TrackStyle3D>('tube');
+  const [trackSmoothness, setTrackSmoothness] = useState<number>(0.7);
+  const [showMarkers, setShowMarkers] = useState<boolean>(true);
   const [titleText, setTitleText] = useState<string>(() =>
     trackName.replace(/[^a-zA-Z0-9\s.\-:]/g, '').toUpperCase().slice(0, 22)
   );
@@ -105,6 +109,9 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       baseThicknessMm,
       trackWidthMm,
       trackHeightMm,
+      trackStyle,
+      trackSmoothness,
+      showMarkers,
       titleText,
       titleSizeMm,
       theme,
@@ -120,6 +127,9 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       baseThicknessMm,
       trackWidthMm,
       trackHeightMm,
+      trackStyle,
+      trackSmoothness,
+      showMarkers,
       titleText,
       titleSizeMm,
       theme,
@@ -659,6 +669,92 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
                 value={baseThicknessMm}
                 onChange={(e) => setBaseThicknessMm(parseInt(e.target.value, 10))}
               />
+            </div>
+
+            {/* Track 3D Style & Smoothing */}
+            <div className="share-control-group">
+              <label>Track 3D Style &amp; Smoothing</label>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '1fr 1fr',
+                  gap: 6,
+                  marginTop: 4,
+                }}
+              >
+                <button
+                  className={`btn-secondary-sm ${trackStyle === 'tube' ? 'btn-active' : ''}`}
+                  style={{
+                    padding: '6px 4px',
+                    fontSize: '0.75rem',
+                    justifyContent: 'center',
+                    fontWeight: trackStyle === 'tube' ? 600 : 400,
+                  }}
+                  onClick={() => setTrackStyle('tube')}
+                  title="Smooth rounded 3D pipe: zero self-intersections, ideal for 3D printing"
+                >
+                  Smooth 3D Tube
+                </button>
+                <button
+                  className={`btn-secondary-sm ${trackStyle === 'ribbon' ? 'btn-active' : ''}`}
+                  style={{
+                    padding: '6px 4px',
+                    fontSize: '0.75rem',
+                    justifyContent: 'center',
+                    fontWeight: trackStyle === 'ribbon' ? 600 : 400,
+                  }}
+                  onClick={() => setTrackStyle('ribbon')}
+                  title="Beveled flat-top ribbon"
+                >
+                  Beveled Ribbon
+                </button>
+              </div>
+
+              {/* Spline Smoothing Slider */}
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginTop: 8,
+                }}
+              >
+                <span style={{ fontSize: '0.74rem', color: '#94a3b8' }}>
+                  Curve Smoothing Filter
+                </span>
+                <span className="slider-val">
+                  {Math.round(trackSmoothness * 100)}%
+                </span>
+              </div>
+              <input
+                type="range"
+                min={0.0}
+                max={1.0}
+                step={0.05}
+                value={trackSmoothness}
+                onChange={(e) => setTrackSmoothness(parseFloat(e.target.value))}
+              />
+
+              {/* Start & Finish Trophy Markers Toggle */}
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginTop: 6,
+                }}
+              >
+                <span style={{ fontSize: '0.74rem', color: '#94a3b8' }}>
+                  Start (Green) &amp; Finish (Red) Pins
+                </span>
+                <button
+                  className={`btn-secondary-sm ${showMarkers ? 'btn-active' : ''}`}
+                  style={{ padding: '2px 8px', fontSize: '0.72rem' }}
+                  onClick={() => setShowMarkers((m) => !m)}
+                >
+                  {showMarkers ? 'Markers ON' : 'Markers OFF'}
+                </button>
+              </div>
             </div>
 
             {/* Track Width & Height */}

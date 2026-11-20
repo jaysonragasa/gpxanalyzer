@@ -12,6 +12,8 @@ export type ColorTheme3D =
   | 'pla'
   | 'custom';
 
+export type TrackStyle3D = 'tube' | 'ribbon';
+
 export interface Terrain3DOptions {
   baseShape: BaseShape3D;
   gridSize: number; // e.g. 40..80
@@ -19,6 +21,9 @@ export interface Terrain3DOptions {
   baseThicknessMm: number; // 3 .. 20
   trackWidthMm: number; // 1.0 .. 5.0
   trackHeightMm: number; // 0.8 .. 4.0
+  trackStyle: TrackStyle3D; // 'tube' | 'ribbon'
+  trackSmoothness: number; // 0.0 .. 1.0 (default 0.7)
+  showMarkers: boolean;
   titleText: string;
   titleSizeMm: number; // 4 .. 12
   theme: ColorTheme3D;
@@ -784,7 +789,7 @@ export function buildTerrainSceneObjects(
     totalTriangles += baseIndices.length / 3;
   }
 
-  // 3. CONTINUOUS SMOOTH 3D TRACK RIBBON (Fixes broken blocks bug)
+  // 3. SILKY SMOOTH 3D TRACK (No creases, no origami folds, no self-intersections)
   const rawPath: Array<{ x: number; y: number; ele: number }> = [];
   for (let i = 0; i < points.length; i += 1) {
     const p = points[i];
@@ -797,194 +802,310 @@ export function buildTerrainSceneObjects(
     rawPath.push({ x, y, ele: ptEles[i] });
   }
 
-  // Filter out duplicate or near-identical successive points
-  const cleanPath: Array<{ x: number; y: number; ele: number }> = [];
+  // Remove microscopic duplicate points (< 0.04mm)
+  const dedupPath: Array<{ x: number; y: number; ele: number }> = [];
   for (let i = 0; i < rawPath.length; i += 1) {
     if (i === 0) {
-      cleanPath.push(rawPath[0]);
+      dedupPath.push(rawPath[0]);
     } else {
-      const prev = cleanPath[cleanPath.length - 1];
+      const prev = dedupPath[dedupPath.length - 1];
       const cur = rawPath[i];
-      if (Math.hypot(cur.x - prev.x, cur.y - prev.y) > 0.12) {
-        cleanPath.push(cur);
+      if (Math.hypot(cur.x - prev.x, cur.y - prev.y) > 0.04) {
+        dedupPath.push(cur);
       }
     }
   }
 
-  const sampledNodes: Array<{ x: number; y: number; zSurf: number }> = [];
-  const pathLen = cleanPath.length;
-  if (pathLen >= 2) {
-    for (let i = 0; i < pathLen; i += 1) {
-      const pt = cleanPath[i];
-      const zSurf =
-        opts.baseShape === 'ribbon'
-          ? eleToZ(pt.ele)
-          : eleToZ(evalElevationAtXY(pt.x, pt.y));
-      sampledNodes.push({ x: pt.x, y: pt.y, zSurf });
+  if (dedupPath.length >= 2) {
+    // 1. Calculate cumulative arc length
+    const cumDist: number[] = [0];
+    for (let i = 1; i < dedupPath.length; i += 1) {
+      const prev = dedupPath[i - 1];
+      const cur = dedupPath[i];
+      cumDist.push(cumDist[i - 1] + Math.hypot(cur.x - prev.x, cur.y - prev.y));
     }
-  }
+    const totalPathLen = cumDist[cumDist.length - 1];
 
-  if (sampledNodes.length >= 2) {
-    const trackPositions: number[] = [];
-    const trackNormals: number[] = [];
-    const trackIndices: number[] = [];
+    if (totalPathLen > 0.15) {
+      // 2. Select smoothed control anchors based on trackSmoothness (0.0 to 1.0)
+      const smoothness = Math.max(0, Math.min(1, opts.trackSmoothness ?? 0.7));
+      const anchorSpacing = 0.8 + smoothness * 2.2; // 0.8mm (sharp) to 3.0mm (ultra smooth)
 
-    const halfWTrack = opts.trackWidthMm * 0.5;
-    const trackExtrude = opts.trackHeightMm;
+      const anchorPts: THREE.Vector3[] = [];
+      anchorPts.push(new THREE.Vector3(dedupPath[0].x, dedupPath[0].y, dedupPath[0].ele));
 
-    interface NodeCrossSection {
-      LTop: [number, number, number];
-      RTop: [number, number, number];
-      LBot: [number, number, number];
-      RBot: [number, number, number];
-    }
+      let lastDist = 0;
+      for (let i = 1; i < dedupPath.length - 1; i += 1) {
+        const curDist = cumDist[i];
+        const prev = dedupPath[i - 1];
+        const cur = dedupPath[i];
+        const next = dedupPath[i + 1];
+        const v1x = cur.x - prev.x;
+        const v1y = cur.y - prev.y;
+        const v2x = next.x - cur.x;
+        const v2y = next.y - cur.y;
+        const l1 = Math.hypot(v1x, v1y) || 1;
+        const l2 = Math.hypot(v2x, v2y) || 1;
+        const dot = (v1x * v2x + v1y * v2y) / (l1 * l2);
 
-    const sections: NodeCrossSection[] = [];
+        const isSharpTurn = dot < 0.2; // apex of hairpin
+        if (curDist - lastDist >= anchorSpacing || isSharpTurn) {
+          anchorPts.push(new THREE.Vector3(cur.x, cur.y, cur.ele));
+          lastDist = curDist;
+        }
+      }
+      const lastPt = dedupPath[dedupPath.length - 1];
+      anchorPts.push(new THREE.Vector3(lastPt.x, lastPt.y, lastPt.ele));
 
-    for (let i = 0; i < sampledNodes.length; i += 1) {
-      const cur = sampledNodes[i];
-      let tx = 0;
-      let ty = 0;
-      let miterScale = 1.0;
+      // 3. Create smooth Catmull-Rom spline
+      const splineTension = 0.2;
+      const smoothSpline = new THREE.CatmullRomCurve3(
+        anchorPts,
+        false,
+        'catmullrom',
+        splineTension
+      );
 
-      if (i === 0) {
-        const next = sampledNodes[1];
-        const len = Math.hypot(next.x - cur.x, next.y - cur.y) || 1;
-        tx = (next.x - cur.x) / len;
-        ty = (next.y - cur.y) / len;
-      } else if (i === sampledNodes.length - 1) {
-        const prev = sampledNodes[i - 1];
-        const len = Math.hypot(cur.x - prev.x, cur.y - prev.y) || 1;
-        tx = (cur.x - prev.x) / len;
-        ty = (cur.y - prev.y) / len;
-      } else {
-        const prev = sampledNodes[i - 1];
-        const next = sampledNodes[i + 1];
-        const d1x = cur.x - prev.x;
-        const d1y = cur.y - prev.y;
-        const l1 = Math.hypot(d1x, d1y) || 1;
-        const v1x = d1x / l1;
-        const v1y = d1y / l1;
+      // 4. Sample equidistant points along the smooth curve
+      const sampleStep = Math.max(0.45, Math.min(1.2, opts.trackWidthMm * 0.35));
+      const numSegments = Math.max(36, Math.min(480, Math.round(totalPathLen / sampleStep)));
+      const smoothCurvePts = smoothSpline.getSpacedPoints(numSegments);
 
-        const d2x = next.x - cur.x;
-        const d2y = next.y - cur.y;
-        const l2 = Math.hypot(d2x, d2y) || 1;
-        const v2x = d2x / l2;
-        const v2y = d2y / l2;
+      // Evaluate terrain elevations and apply moving-average smoothing on Z
+      const rawZ: number[] = [];
+      for (let i = 0; i <= numSegments; i += 1) {
+        const p = smoothCurvePts[i];
+        const surfEle =
+          opts.baseShape === 'ribbon'
+            ? p.z
+            : evalElevationAtXY(p.x, p.y);
+        rawZ.push(eleToZ(surfEle));
+      }
 
-        const tanX = v1x + v2x;
-        const tanY = v1y + v2y;
-        const tanLen = Math.hypot(tanX, tanY);
-
-        if (tanLen > 0.05) {
-          tx = tanX / tanLen;
-          ty = tanY / tanLen;
-          const cosHalf = v1x * tx + v1y * ty;
-          miterScale = Math.min(1.8, 1 / Math.max(0.35, cosHalf));
+      const smoothedZ: number[] = [];
+      for (let i = 0; i <= numSegments; i += 1) {
+        if (i === 0 || i === numSegments) {
+          smoothedZ.push(rawZ[i]);
         } else {
-          tx = v1x;
-          ty = v1y;
+          smoothedZ.push(rawZ[i - 1] * 0.25 + rawZ[i] * 0.5 + rawZ[i + 1] * 0.25);
         }
       }
 
-      // Perpendicular normal in XY
-      const nx = -ty * halfWTrack * miterScale;
-      const ny = tx * halfWTrack * miterScale;
+      let trackGeom: THREE.BufferGeometry;
 
-      const zTop = cur.zSurf + trackExtrude;
-      const zBot =
-        opts.baseShape === 'ribbon' ? 0 : Math.max(0.2, cur.zSurf - 0.4);
+      if (opts.trackStyle === 'ribbon') {
+        // --- SMOOTH BEVELED RIBBON ---
+        const halfW = opts.trackWidthMm * 0.5;
+        const extrudeH = opts.trackHeightMm;
 
-      sections.push({
-        LTop: [cur.x + nx, cur.y + ny, zTop],
-        RTop: [cur.x - nx, cur.y - ny, zTop],
-        LBot: [cur.x + nx, cur.y + ny, zBot],
-        RBot: [cur.x - nx, cur.y - ny, zBot],
+        const ribbonPositions: number[] = [];
+        const ribbonNormals: number[] = [];
+        const ribbonIndices: number[] = [];
+
+        interface RibbonCrossSection {
+          LTop: [number, number, number];
+          RTop: [number, number, number];
+          LBot: [number, number, number];
+          RBot: [number, number, number];
+        }
+
+        const sections: RibbonCrossSection[] = [];
+
+        for (let i = 0; i <= numSegments; i += 1) {
+          const cur = smoothCurvePts[i];
+          const zSurf = smoothedZ[i];
+
+          let tx = 0;
+          let ty = 0;
+          if (i === 0) {
+            const next = smoothCurvePts[1];
+            const l = Math.hypot(next.x - cur.x, next.y - cur.y) || 1;
+            tx = (next.x - cur.x) / l;
+            ty = (next.y - cur.y) / l;
+          } else if (i === numSegments) {
+            const prev = smoothCurvePts[numSegments - 1];
+            const l = Math.hypot(cur.x - prev.x, cur.y - prev.y) || 1;
+            tx = (cur.x - prev.x) / l;
+            ty = (cur.y - prev.y) / l;
+          } else {
+            const prev = smoothCurvePts[i - 1];
+            const next = smoothCurvePts[i + 1];
+            const l = Math.hypot(next.x - prev.x, next.y - prev.y) || 1;
+            tx = (next.x - prev.x) / l;
+            ty = (next.y - prev.y) / l;
+          }
+
+          const nx = -ty * halfW;
+          const ny = tx * halfW;
+
+          const zTop = zSurf + extrudeH;
+          const zBot = opts.baseShape === 'ribbon' ? 0 : Math.max(0.2, zSurf - 0.4);
+
+          sections.push({
+            LTop: [cur.x + nx, cur.y + ny, zTop],
+            RTop: [cur.x - nx, cur.y - ny, zTop],
+            LBot: [cur.x + nx, cur.y + ny, zBot],
+            RBot: [cur.x - nx, cur.y - ny, zBot],
+          });
+        }
+
+        for (let i = 0; i < sections.length - 1; i += 1) {
+          const s0 = sections[i];
+          const s1 = sections[i + 1];
+
+          const pushQuad = (
+            p0: [number, number, number],
+            p1: [number, number, number],
+            p2: [number, number, number],
+            p3: [number, number, number]
+          ) => {
+            const v0 = new THREE.Vector3(...p0);
+            const v1 = new THREE.Vector3(...p1);
+            const v2 = new THREE.Vector3(...p2);
+            const n = new THREE.Vector3().subVectors(v1, v0).cross(new THREE.Vector3().subVectors(v2, v0)).normalize();
+
+            const baseIdx = ribbonPositions.length / 3;
+            ribbonPositions.push(...p0, ...p1, ...p2, ...p3);
+            ribbonNormals.push(n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z);
+            ribbonIndices.push(baseIdx, baseIdx + 1, baseIdx + 2, baseIdx, baseIdx + 2, baseIdx + 3);
+          };
+
+          pushQuad(s0.LTop, s0.RTop, s1.RTop, s1.LTop);
+          pushQuad(s0.LBot, s1.LBot, s1.RBot, s0.RBot);
+          pushQuad(s0.LBot, s0.LTop, s1.LTop, s1.LBot);
+          pushQuad(s0.RTop, s0.RBot, s1.RBot, s1.RTop);
+        }
+
+        const sStart = sections[0];
+        const pushCap = (
+          p0: [number, number, number],
+          p1: [number, number, number],
+          p2: [number, number, number],
+          p3: [number, number, number]
+        ) => {
+          const v0 = new THREE.Vector3(...p0);
+          const v1 = new THREE.Vector3(...p1);
+          const v2 = new THREE.Vector3(...p2);
+          const n = new THREE.Vector3().subVectors(v1, v0).cross(new THREE.Vector3().subVectors(v2, v0)).normalize();
+
+          const baseIdx = ribbonPositions.length / 3;
+          ribbonPositions.push(...p0, ...p1, ...p2, ...p3);
+          ribbonNormals.push(n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z);
+          ribbonIndices.push(baseIdx, baseIdx + 1, baseIdx + 2, baseIdx, baseIdx + 2, baseIdx + 3);
+        };
+        pushCap(sStart.LBot, sStart.RBot, sStart.RTop, sStart.LTop);
+
+        const sEnd = sections[sections.length - 1];
+        pushCap(sEnd.RBot, sEnd.LBot, sEnd.LTop, sEnd.RTop);
+
+        trackGeom = new THREE.BufferGeometry();
+        trackGeom.setAttribute('position', new THREE.Float32BufferAttribute(ribbonPositions, 3));
+        trackGeom.setAttribute('normal', new THREE.Float32BufferAttribute(ribbonNormals, 3));
+        trackGeom.setIndex(ribbonIndices);
+        trackGeom.computeVertexNormals();
+      } else {
+        // --- SMOOTH 3D TUBE / PIPE (Default, Recommended for 3D Printing) ---
+        const tubeRadius = Math.max(0.6, opts.trackWidthMm * 0.5);
+        const tubeElevOffset =
+          opts.baseShape === 'ribbon'
+            ? opts.trackHeightMm
+            : Math.max(0.3, opts.trackHeightMm * 0.35);
+
+        const centerline3D: THREE.Vector3[] = [];
+        for (let i = 0; i <= numSegments; i += 1) {
+          const p = smoothCurvePts[i];
+          centerline3D.push(new THREE.Vector3(p.x, p.y, smoothedZ[i] + tubeElevOffset));
+        }
+
+        const path3D = new THREE.CatmullRomCurve3(centerline3D, false, 'catmullrom', 0.15);
+        const radialSegments = 12;
+        const tube = new THREE.TubeGeometry(
+          path3D,
+          numSegments,
+          tubeRadius,
+          radialSegments,
+          false
+        );
+
+        // Add watertight circular end caps at start and end
+        const tubePos = Array.from(tube.attributes.position.array);
+        const tubeIdx = Array.from(tube.index!.array);
+
+        // Start cap: ring 0 (vertices 0..radialSegments)
+        const centerStartIdx = tubePos.length / 3;
+        const startPt = centerline3D[0];
+        tubePos.push(startPt.x, startPt.y, startPt.z);
+        for (let j = 0; j < radialSegments; j += 1) {
+          tubeIdx.push(centerStartIdx, j + 1, j);
+        }
+
+        // End cap: ring numSegments
+        const centerEndIdx = tubePos.length / 3;
+        const endPt = centerline3D[centerline3D.length - 1];
+        tubePos.push(endPt.x, endPt.y, endPt.z);
+        const endRingBase = numSegments * (radialSegments + 1);
+        for (let j = 0; j < radialSegments; j += 1) {
+          tubeIdx.push(centerEndIdx, endRingBase + j, endRingBase + j + 1);
+        }
+
+        trackGeom = new THREE.BufferGeometry();
+        trackGeom.setAttribute('position', new THREE.Float32BufferAttribute(tubePos, 3));
+        trackGeom.setIndex(tubeIdx);
+        trackGeom.computeVertexNormals();
+      }
+
+      const trackMat = new THREE.MeshStandardMaterial({
+        color: palette.track,
+        roughness: 0.32,
+        metalness: 0.22,
+        emissive: palette.track,
+        emissiveIntensity: 0.18,
       });
+
+      const trackMesh = new THREE.Mesh(trackGeom, trackMat);
+      trackMesh.name = 'trackMesh';
+      trackMesh.castShadow = true;
+      displayGroup.add(trackMesh);
+      exportGroup.add(trackMesh.clone());
+      totalTriangles += trackGeom.index!.count / 3;
+
+      // 4. Start & Finish Marker Pins (if enabled)
+      if (opts.showMarkers) {
+        const markerRadius = Math.max(1.4, opts.trackWidthMm * 0.75);
+        const startPt = smoothCurvePts[0];
+        const startZ = smoothedZ[0] + opts.trackHeightMm + markerRadius * 0.8;
+
+        const startPinGeom = new THREE.SphereGeometry(markerRadius, 14, 10);
+        startPinGeom.translate(startPt.x, startPt.y, startZ);
+        const startPinMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color('#22c55e'),
+          roughness: 0.3,
+          metalness: 0.2,
+          emissive: new THREE.Color('#15803d'),
+          emissiveIntensity: 0.2,
+        });
+        const startPinMesh = new THREE.Mesh(startPinGeom, startPinMat);
+        displayGroup.add(startPinMesh);
+        exportGroup.add(startPinMesh.clone());
+        totalTriangles += startPinGeom.index!.count / 3;
+
+        const endPt = smoothCurvePts[numSegments];
+        const endZ = smoothedZ[numSegments] + opts.trackHeightMm + markerRadius * 0.8;
+        const endPinGeom = new THREE.SphereGeometry(markerRadius, 14, 10);
+        endPinGeom.translate(endPt.x, endPt.y, endZ);
+        const endPinMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color('#ef4444'),
+          roughness: 0.3,
+          metalness: 0.2,
+          emissive: new THREE.Color('#b91c1c'),
+          emissiveIntensity: 0.2,
+        });
+        const endPinMesh = new THREE.Mesh(endPinGeom, endPinMat);
+        displayGroup.add(endPinMesh);
+        exportGroup.add(endPinMesh.clone());
+        totalTriangles += endPinGeom.index!.count / 3;
+      }
     }
-
-    // Connect sections continuously without gaps
-    for (let i = 0; i < sections.length - 1; i += 1) {
-      const s0 = sections[i];
-      const s1 = sections[i + 1];
-
-      const pushQuad = (
-        p0: [number, number, number],
-        p1: [number, number, number],
-        p2: [number, number, number],
-        p3: [number, number, number]
-      ) => {
-        const v0 = new THREE.Vector3(...p0);
-        const v1 = new THREE.Vector3(...p1);
-        const v2 = new THREE.Vector3(...p2);
-        const n = new THREE.Vector3().subVectors(v1, v0).cross(new THREE.Vector3().subVectors(v2, v0)).normalize();
-
-        const baseIdx = trackPositions.length / 3;
-        trackPositions.push(...p0, ...p1, ...p2, ...p3);
-        trackNormals.push(n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z);
-        trackIndices.push(baseIdx, baseIdx + 1, baseIdx + 2, baseIdx, baseIdx + 2, baseIdx + 3);
-      };
-
-      // Top surface ribbon
-      pushQuad(s0.LTop, s0.RTop, s1.RTop, s1.LTop);
-
-      // Bottom surface ribbon
-      pushQuad(s0.LBot, s1.LBot, s1.RBot, s0.RBot);
-
-      // Left wall
-      pushQuad(s0.LBot, s0.LTop, s1.LTop, s1.LBot);
-
-      // Right wall
-      pushQuad(s0.RTop, s0.RBot, s1.RBot, s1.RTop);
-    }
-
-    // Start Cap
-    const sStart = sections[0];
-    const pushCap = (
-      p0: [number, number, number],
-      p1: [number, number, number],
-      p2: [number, number, number],
-      p3: [number, number, number]
-    ) => {
-      const v0 = new THREE.Vector3(...p0);
-      const v1 = new THREE.Vector3(...p1);
-      const v2 = new THREE.Vector3(...p2);
-      const n = new THREE.Vector3().subVectors(v1, v0).cross(new THREE.Vector3().subVectors(v2, v0)).normalize();
-
-      const baseIdx = trackPositions.length / 3;
-      trackPositions.push(...p0, ...p1, ...p2, ...p3);
-      trackNormals.push(n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z);
-      trackIndices.push(baseIdx, baseIdx + 1, baseIdx + 2, baseIdx, baseIdx + 2, baseIdx + 3);
-    };
-
-    pushCap(sStart.LBot, sStart.RBot, sStart.RTop, sStart.LTop);
-
-    // End Cap
-    const sEnd = sections[sections.length - 1];
-    pushCap(sEnd.RBot, sEnd.LBot, sEnd.LTop, sEnd.RTop);
-
-    const trackGeom = new THREE.BufferGeometry();
-    trackGeom.setAttribute(
-      'position',
-      new THREE.Float32BufferAttribute(trackPositions, 3)
-    );
-    trackGeom.setAttribute('normal', new THREE.Float32BufferAttribute(trackNormals, 3));
-    trackGeom.setIndex(trackIndices);
-
-    const trackMat = new THREE.MeshStandardMaterial({
-      color: palette.track,
-      roughness: 0.35,
-      metalness: 0.2,
-      emissive: palette.track,
-      emissiveIntensity: 0.16,
-    });
-
-    const trackMesh = new THREE.Mesh(trackGeom, trackMat);
-    trackMesh.name = 'trackMesh';
-    trackMesh.castShadow = true;
-    displayGroup.add(trackMesh);
-    exportGroup.add(trackMesh.clone());
-    totalTriangles += trackIndices.length / 3;
   }
 
   // 4. 3D TITLE PLAQUE & EMBOSSED TEXT (Fixes text inside model bug)
