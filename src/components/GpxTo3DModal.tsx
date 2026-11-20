@@ -16,12 +16,42 @@ import {
   BaseShape3D,
   buildTerrainSceneObjects,
   ColorTheme3D,
+  computeTrackAspect,
+  getTargetAspect,
+  PlaquePosition3D,
   DemGridData,
   exportSceneToBinaryStl,
   fetchMap3DTerrainAndTextures,
   Terrain3DOptions,
   TrackStyle3D,
 } from '../utils/terrain3d';
+
+// Frees GPU resources (geometries, materials and their textures) of a group
+function disposeGroup(group: THREE.Object3D) {
+  group.traverse((child) => {
+    if (child instanceof THREE.Mesh) {
+      child.geometry.dispose();
+      const mats: THREE.Material[] = Array.isArray(child.material)
+        ? child.material
+        : [child.material];
+      for (const m of mats) {
+        const map = (m as THREE.MeshStandardMaterial).map;
+        if (map) map.dispose();
+        m.dispose();
+      }
+    }
+  });
+}
+
+// Delays a value so rapid slider drags / typing trigger one rebuild, not dozens
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = window.setTimeout(() => setDebounced(value), delayMs);
+    return () => window.clearTimeout(id);
+  }, [value, delayMs]);
+  return debounced;
+}
 
 interface GpxTo3DModalProps {
   trackName: string;
@@ -45,9 +75,90 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
   const [trackStyle, setTrackStyle] = useState<TrackStyle3D>('tube');
   const [trackSmoothness, setTrackSmoothness] = useState<number>(0.7);
   const [showMarkers, setShowMarkers] = useState<boolean>(true);
+
+  // Model footprint (map area) size
+  const trackAspect = useMemo(() => computeTrackAspect(points), [points]);
+  const [modelWidthMm, setModelWidthMm] = useState<number>(110);
+  const [manualHeightMm, setManualHeightMm] = useState<number>(110);
+  const [lockAspect, setLockAspect] = useState<boolean>(true);
+  const isRoundBase = baseShape === 'circle' || baseShape === 'hexagon';
+  const modelHeightMm = isRoundBase
+    ? modelWidthMm
+    : lockAspect
+    ? Math.max(30, Math.min(300, Math.round(modelWidthMm / trackAspect)))
+    : manualHeightMm;
+
+  const [plaquePosition, setPlaquePosition] = useState<PlaquePosition3D>('bottom');
+
+  // Keychain ring
+  const [keychainEnabled, setKeychainEnabled] = useState<boolean>(false);
+  const [keychainOuterDiameterMm, setKeychainOuterDiameterMm] = useState<number>(14);
+  const [keychainHoleDiameterMm, setKeychainHoleDiameterMm] = useState<number>(6);
+  const [keychainAngleDeg, setKeychainAngleDeg] = useState<number>(360);
+  const [keychainThicknessMm, setKeychainThicknessMm] = useState<number>(3);
+
+  // Auto-calculated Track Stats for Plaque
+  const autoStats = useMemo(() => {
+    let totalDistM = 0;
+    let maxAlt = 0;
+    let firstTime: string | undefined;
+    let lastTime: string | undefined;
+
+    for (let i = 0; i < points.length; i += 1) {
+      const p = points[i];
+      if (p.time && !firstTime) firstTime = p.time;
+      if (p.time) lastTime = p.time;
+
+      const alt = terrainElevations[p.id] !== undefined ? terrainElevations[p.id] : (p.ele ?? 0);
+      if (alt > maxAlt) maxAlt = alt;
+
+      if (i > 0) {
+        const pPrev = points[i - 1];
+        const dLat = (p.lat - pPrev.lat) * (Math.PI / 180);
+        const dLon = (p.lon - pPrev.lon) * (Math.PI / 180);
+        const lat1 = pPrev.lat * (Math.PI / 180);
+        const lat2 = p.lat * (Math.PI / 180);
+        const a =
+          Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.sin(dLon / 2) * Math.sin(dLon / 2) * Math.cos(lat1) * Math.cos(lat2);
+        totalDistM += 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      }
+    }
+
+    let dateStr = '';
+    if (firstTime) {
+      const d = new Date(firstTime);
+      if (!isNaN(d.getTime())) {
+        const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+        dateStr = `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
+      }
+    }
+    if (!dateStr) dateStr = new Date().toISOString().slice(0, 10);
+
+    let durationStr = '01:00:00';
+    if (firstTime && lastTime) {
+      const sec = Math.max(0, Math.round((new Date(lastTime).getTime() - new Date(firstTime).getTime()) / 1000));
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      durationStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
+
+    const distStr = `${(totalDistM / 1000).toFixed(1)} KM`;
+    const altStr = `${Math.round(maxAlt)} M`;
+
+    return { dateStr, distStr, durationStr, altStr };
+  }, [points, terrainElevations]);
+
+  const [enablePlaqueTitle, setEnablePlaqueTitle] = useState<boolean>(true);
   const [titleText, setTitleText] = useState<string>(() =>
     trackName.replace(/[^a-zA-Z0-9\s.\-:]/g, '').toUpperCase().slice(0, 22)
   );
+  const [showPlaqueStats, setShowPlaqueStats] = useState<boolean>(true);
+  const [titleDateText, setTitleDateText] = useState<string>(() => autoStats.dateStr);
+  const [titleDistanceText, setTitleDistanceText] = useState<string>(() => autoStats.distStr);
+  const [titleDurationText, setTitleDurationText] = useState<string>(() => autoStats.durationStr);
+  const [titleElevationText, setTitleElevationText] = useState<string>(() => autoStats.altStr);
   const [titleSizeMm, setTitleSizeMm] = useState<number>(6.5);
   const [theme, setTheme] = useState<ColorTheme3D>('satellite');
   const [customLowColor, setCustomLowColor] = useState('#2a703e');
@@ -75,25 +186,34 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
   const currentDisplayGroupRef = useRef<THREE.Group | null>(null);
   const exportGroupRef = useRef<THREE.Group | null>(null);
 
+  // The terrain/texture area must match the model aspect, so it is refetched
+  // when the size or base shape changes (debounced; stale responses ignored)
+  const mapAspect =
+    Math.round(getTargetAspect({ baseShape, modelWidthMm, modelHeightMm }) * 100) / 100;
+  const fetchKey = useDebouncedValue(`${mapAspect}|${isRoundBase}`, 600);
+  const fetchSeqRef = useRef(0);
+
   const handleLoadMap3D = async () => {
     if (points.length < 2) return;
+    const seq = ++fetchSeqRef.current;
     setIsFetchingDem(true);
     try {
-      const bundle = await fetchMap3DTerrainAndTextures(points);
+      const bundle = await fetchMap3DTerrainAndTextures(points, mapAspect, isRoundBase);
+      if (seq !== fetchSeqRef.current) return;
       setDemGrid(bundle.demGrid);
-      if (bundle.satelliteCanvas) setSatelliteCanvas(bundle.satelliteCanvas);
-      if (bundle.topoCanvas) setTopoCanvas(bundle.topoCanvas);
+      setSatelliteCanvas(bundle.satelliteCanvas);
+      setTopoCanvas(bundle.topoCanvas);
     } catch (err) {
       console.warn('3D terrain tile fetch warning:', err);
     } finally {
-      setIsFetchingDem(false);
+      if (seq === fetchSeqRef.current) setIsFetchingDem(false);
     }
   };
 
-  // Automatically load Map 3D Terrain Depth & Satellite Texture on mount
   useEffect(() => {
     void handleLoadMap3D();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [points, fetchKey]);
 
   const activeTextureCanvas = useMemo(() => {
     if (theme === 'satellite') return satelliteCanvas;
@@ -104,6 +224,14 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
   const options: Terrain3DOptions = useMemo(
     () => ({
       baseShape,
+      modelWidthMm,
+      modelHeightMm,
+      plaquePosition,
+      keychainEnabled,
+      keychainOuterDiameterMm,
+      keychainHoleDiameterMm,
+      keychainAngleDeg,
+      keychainThicknessMm,
       gridSize,
       zExaggeration,
       baseThicknessMm,
@@ -112,7 +240,13 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       trackStyle,
       trackSmoothness,
       showMarkers,
+      enablePlaqueTitle,
       titleText,
+      titleDateText,
+      titleDistanceText,
+      titleDurationText,
+      titleElevationText,
+      showPlaqueStats,
       titleSizeMm,
       theme,
       customLowColor,
@@ -122,6 +256,14 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
     }),
     [
       baseShape,
+      modelWidthMm,
+      modelHeightMm,
+      plaquePosition,
+      keychainEnabled,
+      keychainOuterDiameterMm,
+      keychainHoleDiameterMm,
+      keychainAngleDeg,
+      keychainThicknessMm,
       gridSize,
       zExaggeration,
       baseThicknessMm,
@@ -130,7 +272,13 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       trackStyle,
       trackSmoothness,
       showMarkers,
+      enablePlaqueTitle,
       titleText,
+      titleDateText,
+      titleDistanceText,
+      titleDurationText,
+      titleElevationText,
+      showPlaqueStats,
       titleSizeMm,
       theme,
       customLowColor,
@@ -139,6 +287,8 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       customBaseColor,
     ]
   );
+
+  const buildOptions = useDebouncedValue(options, 150);
 
   // Initialize Three.js WebGL Scene & OrbitControls
   useEffect(() => {
@@ -192,14 +342,23 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
     const dirLight = new THREE.DirectionalLight(0xffffff, 1.35);
     dirLight.position.set(-70, -100, 140);
     dirLight.castShadow = true;
+    // Default shadow frustum is +/-5 units; the model spans ~110-150 mm
+    dirLight.shadow.camera.left = -110;
+    dirLight.shadow.camera.right = 110;
+    dirLight.shadow.camera.top = 110;
+    dirLight.shadow.camera.bottom = -110;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 400;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.bias = -0.0005;
     scene.add(dirLight);
 
     const fillLight = new THREE.DirectionalLight(0x93c5fd, 0.45);
     fillLight.position.set(80, 90, 80);
     scene.add(fillLight);
 
-    // Subtle floor shadow grid helper
-    const gridHelper = new THREE.GridHelper(240, 24, 0x334155, 0x1e293b);
+    // Print bed grid: 180 x 180 mm (Bambu Lab A1 mini), 10 mm squares
+    const gridHelper = new THREE.GridHelper(180, 18, 0x334155, 0x1e293b);
     gridHelper.rotation.x = Math.PI / 2;
     gridHelper.position.z = -0.1;
     scene.add(gridHelper);
@@ -228,6 +387,10 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       cancelAnimationFrame(animId);
       window.removeEventListener('resize', handleResize);
       controls.dispose();
+      if (currentDisplayGroupRef.current) {
+        disposeGroup(currentDisplayGroupRef.current);
+        currentDisplayGroupRef.current = null;
+      }
       renderer.dispose();
       scene.clear();
     };
@@ -241,16 +404,7 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
     // Remove previous display group
     if (currentDisplayGroupRef.current) {
       scene.remove(currentDisplayGroupRef.current);
-      currentDisplayGroupRef.current.traverse((child) => {
-        if (child instanceof THREE.Mesh) {
-          child.geometry.dispose();
-          if (Array.isArray(child.material)) {
-            child.material.forEach((m) => m.dispose());
-          } else {
-            child.material.dispose();
-          }
-        }
-      });
+      disposeGroup(currentDisplayGroupRef.current);
       currentDisplayGroupRef.current = null;
     }
 
@@ -260,7 +414,7 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       terrainElevations,
       demGrid,
       activeTextureCanvas,
-      options
+      buildOptions
     );
 
     scene.add(bundle.displayGroup);
@@ -272,7 +426,7 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
     if (controlsRef.current) {
       controlsRef.current.target.set(0, 0, Math.min(20, bundle.stats.heightMm * 0.4));
     }
-  }, [points, terrainElevations, demGrid, activeTextureCanvas, options]);
+  }, [points, terrainElevations, demGrid, activeTextureCanvas, buildOptions]);
 
   // Preset Camera Views
   const setPresetView = (view: 'iso' | 'top' | 'front') => {
@@ -307,7 +461,8 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
     a.href = url;
     a.download = `${safeName}.stl`;
     a.click();
-    URL.revokeObjectURL(url);
+    // Revoking synchronously can cancel the download in some browsers
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   // Export High-Res PNG Screenshot
@@ -324,7 +479,7 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div
-        className="share-modal"
+        className="share-modal studio-3d-modal"
         style={{ maxWidth: '1180px' }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -551,6 +706,83 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
               </div>
             </div>
 
+            {/* Model Size */}
+            <div className="share-control-group">
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <label>Model Size (Map Area)</label>
+                {!isRoundBase && (
+                  <label
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 5,
+                      fontSize: '0.72rem',
+                      color: '#94a3b8',
+                      cursor: 'pointer',
+                      margin: 0,
+                    }}
+                    title="Keep the height proportional to the track's shape"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={lockAspect}
+                      onChange={(e) => {
+                        if (!e.target.checked) setManualHeightMm(modelHeightMm);
+                        setLockAspect(e.target.checked);
+                      }}
+                      style={{ cursor: 'pointer', accentColor: '#38bdf8' }}
+                    />
+                    Fit to track
+                  </label>
+                )}
+              </div>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginTop: 4,
+                }}
+              >
+                <span style={{ fontSize: '0.74rem', color: '#94a3b8' }}>
+                  {isRoundBase ? 'Diameter' : 'Width'}
+                </span>
+                <span className="slider-val">{modelWidthMm} mm</span>
+              </div>
+              <input
+                type="range"
+                min={30}
+                max={250}
+                step={5}
+                value={modelWidthMm}
+                onChange={(e) => setModelWidthMm(parseInt(e.target.value, 10))}
+              />
+              {!isRoundBase && (
+                <>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      marginTop: 4,
+                    }}
+                  >
+                    <span style={{ fontSize: '0.74rem', color: '#94a3b8' }}>Height</span>
+                    <span className="slider-val">{modelHeightMm} mm</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={30}
+                    max={250}
+                    step={5}
+                    value={modelHeightMm}
+                    disabled={lockAspect}
+                    onChange={(e) => setManualHeightMm(parseInt(e.target.value, 10))}
+                  />
+                </>
+              )}
+            </div>
+
             {/* Theme Selector */}
             <div className="share-control-group">
               <label>Visual Color Theme &amp; Texture</label>
@@ -691,7 +923,7 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
                     fontWeight: trackStyle === 'tube' ? 600 : 400,
                   }}
                   onClick={() => setTrackStyle('tube')}
-                  title="Smooth rounded 3D pipe: zero self-intersections, ideal for 3D printing"
+                  title="Rounded-top track that sits flat on the terrain: no overhangs when printed"
                 >
                   Smooth 3D Tube
                 </button>
@@ -745,7 +977,7 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
                 }}
               >
                 <span style={{ fontSize: '0.74rem', color: '#94a3b8' }}>
-                  Start (Green) &amp; Finish (Red) Pins
+                  Start (Green) &amp; Finish (Red) Markers
                 </span>
                 <button
                   className={`btn-secondary-sm ${showMarkers ? 'btn-active' : ''}`}
@@ -795,37 +1027,255 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
               </div>
             </div>
 
-            {/* 3D Embossed Title Plaque */}
+            {/* 3D Base Trophy Plaque & Multi-line Stats */}
+            {baseShape !== 'ribbon' && (
+              <div className="share-control-group">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer', fontWeight: 600, margin: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={enablePlaqueTitle}
+                      onChange={(e) => setEnablePlaqueTitle(e.target.checked)}
+                      style={{ cursor: 'pointer', width: 15, height: 15, accentColor: '#38bdf8' }}
+                    />
+                    <span>3D Embossed Plaque Title</span>
+                  </label>
+                  {enablePlaqueTitle && (
+                    <button
+                      className={`btn-secondary-sm ${showPlaqueStats ? 'btn-active' : ''}`}
+                      style={{ padding: '2px 8px', fontSize: '0.72rem' }}
+                      onClick={() => setShowPlaqueStats((s) => !s)}
+                      title="Toggle Date, Distance, Duration, and Max Altitude on the base"
+                    >
+                      {showPlaqueStats ? 'Trophy Stats ON' : 'Title Only'}
+                    </button>
+                  )}
+                </div>
+
+                {enablePlaqueTitle ? (
+                  <>
+                    {/* Plaque Position */}
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(4, 1fr)',
+                        gap: 6,
+                        marginTop: 6,
+                      }}
+                    >
+                      {(['bottom', 'top', 'left', 'right'] as PlaquePosition3D[]).map((pos) => (
+                        <button
+                          key={pos}
+                          className={`btn-secondary-sm ${plaquePosition === pos ? 'btn-active' : ''}`}
+                          style={{
+                            textTransform: 'capitalize',
+                            padding: '4px 2px',
+                            justifyContent: 'center',
+                            fontSize: '0.74rem',
+                          }}
+                          onClick={() => setPlaquePosition(pos)}
+                          title={
+                            pos === 'left' || pos === 'right'
+                              ? 'Side plaque: text runs along the edge'
+                              : `Plaque on the ${pos} edge`
+                          }
+                        >
+                          {pos}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Title Line */}
+                    <input
+                      type="text"
+                      className="input-text"
+                      placeholder="ROUTE / SUMMIT NAME"
+                      value={titleText}
+                      maxLength={26}
+                      onChange={(e) => setTitleText(e.target.value.toUpperCase())}
+                      style={{ marginTop: 6, width: '100%', fontSize: '0.82rem' }}
+                    />
+
+                    {showPlaqueStats && (
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: '1fr 1fr',
+                          gap: 6,
+                          marginTop: 6,
+                          backgroundColor: '#0f172a',
+                          padding: '8px',
+                          borderRadius: '6px',
+                          border: '1px solid #1e293b',
+                        }}
+                      >
+                        <div>
+                          <span style={{ fontSize: '0.70rem', color: '#94a3b8', display: 'block' }}>Date</span>
+                          <input
+                            type="text"
+                            className="input-text"
+                            value={titleDateText}
+                            maxLength={16}
+                            onChange={(e) => setTitleDateText(e.target.value.toUpperCase())}
+                            style={{ width: '100%', fontSize: '0.74rem', padding: '3px 6px' }}
+                          />
+                        </div>
+                        <div>
+                          <span style={{ fontSize: '0.70rem', color: '#94a3b8', display: 'block' }}>Distance</span>
+                          <input
+                            type="text"
+                            className="input-text"
+                            value={titleDistanceText}
+                            maxLength={12}
+                            onChange={(e) => setTitleDistanceText(e.target.value.toUpperCase())}
+                            style={{ width: '100%', fontSize: '0.74rem', padding: '3px 6px' }}
+                          />
+                        </div>
+                        <div>
+                          <span style={{ fontSize: '0.70rem', color: '#94a3b8', display: 'block' }}>Duration</span>
+                          <input
+                            type="text"
+                            className="input-text"
+                            value={titleDurationText}
+                            maxLength={12}
+                            onChange={(e) => setTitleDurationText(e.target.value.toUpperCase())}
+                            style={{ width: '100%', fontSize: '0.74rem', padding: '3px 6px' }}
+                          />
+                        </div>
+                        <div>
+                          <span style={{ fontSize: '0.70rem', color: '#94a3b8', display: 'block' }}>Max Altitude</span>
+                          <input
+                            type="text"
+                            className="input-text"
+                            value={titleElevationText}
+                            maxLength={10}
+                            onChange={(e) => setTitleElevationText(e.target.value.toUpperCase())}
+                            style={{ width: '100%', fontSize: '0.74rem', padding: '3px 6px' }}
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        marginTop: 6,
+                      }}
+                    >
+                      <span style={{ fontSize: '0.74rem', color: '#94a3b8' }}>Letter Size</span>
+                      <span className="slider-val">{titleSizeMm.toFixed(1)} mm</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={4.5}
+                      max={9.0}
+                      step={0.5}
+                      value={titleSizeMm}
+                      onChange={(e) => setTitleSizeMm(parseFloat(e.target.value))}
+                    />
+                  </>
+                ) : (
+                  <div style={{ fontSize: '0.74rem', color: '#64748b', marginTop: 4, fontStyle: 'italic' }}>
+                    Plaque title disabled — full terrain relief extends across the entire base.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Keychain Ring */}
             <div className="share-control-group">
-              <label>3D Embossed Plaque Title</label>
-              <input
-                type="text"
-                className="input-text"
-                placeholder="ROUTE / SUMMIT NAME"
-                value={titleText}
-                maxLength={24}
-                onChange={(e) => setTitleText(e.target.value.toUpperCase())}
-                style={{ marginTop: 4, width: '100%', fontSize: '0.82rem' }}
-              />
-              <div
+              <label
                 style={{
                   display: 'flex',
-                  justifyContent: 'space-between',
                   alignItems: 'center',
-                  marginTop: 6,
+                  gap: 7,
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                  margin: 0,
                 }}
               >
-                <span style={{ fontSize: '0.74rem', color: '#94a3b8' }}>Letter Size</span>
-                <span className="slider-val">{titleSizeMm.toFixed(1)} mm</span>
-              </div>
-              <input
-                type="range"
-                min={4.5}
-                max={10.0}
-                step={0.5}
-                value={titleSizeMm}
-                onChange={(e) => setTitleSizeMm(parseFloat(e.target.value))}
-              />
+                <input
+                  type="checkbox"
+                  checked={keychainEnabled}
+                  onChange={(e) => setKeychainEnabled(e.target.checked)}
+                  style={{ cursor: 'pointer', width: 15, height: 15, accentColor: '#38bdf8' }}
+                />
+                <span>Keychain Ring</span>
+              </label>
+              {keychainEnabled && (
+                <>
+                  {(
+                    [
+                      {
+                        label: 'Ring Size (outer Ø)',
+                        value: keychainOuterDiameterMm,
+                        min: 8,
+                        max: 30,
+                        step: 1,
+                        unit: 'mm',
+                        set: (v: number) => {
+                          setKeychainOuterDiameterMm(v);
+                          setKeychainHoleDiameterMm((h) => Math.min(h, v - 3));
+                        },
+                      },
+                      {
+                        label: 'Hole Size (inner Ø)',
+                        value: keychainHoleDiameterMm,
+                        min: 2,
+                        max: keychainOuterDiameterMm - 3,
+                        step: 0.5,
+                        unit: 'mm',
+                        set: setKeychainHoleDiameterMm,
+                      },
+                      {
+                        label: 'Thickness',
+                        value: keychainThicknessMm,
+                        min: 1.5,
+                        max: 10,
+                        step: 0.5,
+                        unit: 'mm',
+                        set: setKeychainThicknessMm,
+                      },
+                      {
+                        label: 'Position (0° = top, clockwise)',
+                        value: keychainAngleDeg,
+                        min: 1,
+                        max: 360,
+                        step: 1,
+                        unit: '°',
+                        set: setKeychainAngleDeg,
+                      },
+                    ] as const
+                  ).map((s) => (
+                    <div key={s.label}>
+                      <div
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          marginTop: 6,
+                        }}
+                      >
+                        <span style={{ fontSize: '0.74rem', color: '#94a3b8' }}>{s.label}</span>
+                        <span className="slider-val">
+                          {s.value}
+                          {s.unit === '°' ? '°' : ` ${s.unit}`}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={s.min}
+                        max={s.max}
+                        step={s.step}
+                        value={s.value}
+                        onChange={(e) => s.set(parseFloat(e.target.value))}
+                      />
+                    </div>
+                  ))}
+                </>
+              )}
             </div>
 
             {/* Grid Quality */}

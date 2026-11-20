@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { lazy, Suspense, useCallback, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   Box,
@@ -42,7 +42,10 @@ import { Sidebar } from './components/Sidebar';
 import { ArchiveMap } from './components/ArchiveMap';
 import { ArchiveSidebar } from './components/ArchiveSidebar';
 import { ShareCardModal } from './components/ShareCardModal';
-import { GpxTo3DModal } from './components/GpxTo3DModal';
+// three.js is large; load the 3D studio only when it is opened
+const GpxTo3DModal = lazy(() =>
+  import('./components/GpxTo3DModal').then((m) => ({ default: m.GpxTo3DModal }))
+);
 import { fetchTerrainElevations } from './utils/elevationApi';
 import {
   ArchiveActivity,
@@ -112,6 +115,12 @@ export function App() {
     if (doc.tracks.length === 0) return undefined;
     return doc.tracks.find((t) => t.id === activeTrackId) || doc.tracks[0];
   }, [doc.tracks, activeTrackId]);
+
+  // Stable reference so the 3D modal does not rebuild its scene on every App render
+  const activeTrackPoints = useMemo(
+    () => (activeTrack ? activeTrack.segments.flatMap((s) => s.points) : []),
+    [activeTrack]
+  );
 
   const stats = useMemo(() => computeTrackStats(activeTrack), [activeTrack]);
   const timestampHealth = useMemo(() => analyzeTimestampHealth(activeTrack), [activeTrack]);
@@ -1236,12 +1245,14 @@ export function App() {
 
       {/* GPX to 3D Terrain & STL Studio Modal */}
       {show3DModal && activeTrack && (
-        <GpxTo3DModal
-          trackName={activeTrack.name || doc.metadata.name || 'GPX Track'}
-          points={activeTrack.segments.flatMap((s) => s.points)}
-          terrainElevations={terrainElevations}
-          onClose={() => setShow3DModal(false)}
-        />
+        <Suspense fallback={<div className="toast">Loading 3D studio...</div>}>
+          <GpxTo3DModal
+            trackName={activeTrack.name || doc.metadata.name || 'GPX Track'}
+            points={activeTrackPoints}
+            terrainElevations={terrainElevations}
+            onClose={() => setShow3DModal(false)}
+          />
+        </Suspense>
       )}
 
       {/* Toast Notification */}

@@ -1,6 +1,9 @@
 import * as THREE from 'three';
 import { STLExporter } from 'three/examples/jsm/exporters/STLExporter.js';
+import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { Font, type FontData } from 'three/examples/jsm/loaders/FontLoader.js';
 import { TrackPoint } from '../types/gpx';
+import helvetikerBold from '../assets/fonts/helvetiker_bold.typeface.json';
 
 export type BaseShape3D = 'rectangle' | 'circle' | 'hexagon' | 'ribbon';
 export type ColorTheme3D =
@@ -13,9 +16,12 @@ export type ColorTheme3D =
   | 'custom';
 
 export type TrackStyle3D = 'tube' | 'ribbon';
+export type PlaquePosition3D = 'bottom' | 'top' | 'left' | 'right';
 
 export interface Terrain3DOptions {
   baseShape: BaseShape3D;
+  modelWidthMm: number; // map area width (X). Circle/hexagon: diameter
+  modelHeightMm: number; // map area height (Y). Ignored for circle/hexagon
   gridSize: number; // e.g. 40..80
   zExaggeration: number; // 0.5 .. 3.5
   baseThicknessMm: number; // 3 .. 20
@@ -24,8 +30,20 @@ export interface Terrain3DOptions {
   trackStyle: TrackStyle3D; // 'tube' | 'ribbon'
   trackSmoothness: number; // 0.0 .. 1.0 (default 0.7)
   showMarkers: boolean;
+  enablePlaqueTitle?: boolean;
   titleText: string;
+  titleDateText?: string;
+  titleDistanceText?: string;
+  titleDurationText?: string;
+  titleElevationText?: string;
+  showPlaqueStats?: boolean;
   titleSizeMm: number; // 4 .. 12
+  plaquePosition?: PlaquePosition3D;
+  keychainEnabled?: boolean;
+  keychainOuterDiameterMm?: number;
+  keychainHoleDiameterMm?: number;
+  keychainAngleDeg?: number; // 0/360 = top (north), clockwise
+  keychainThicknessMm?: number;
   theme: ColorTheme3D;
   customLowColor: string;
   customHighColor: string;
@@ -87,7 +105,16 @@ function loadImageCors(url: string): Promise<HTMLImageElement> {
   });
 }
 
-export function computeTrackBoundingBox(points: TrackPoint[]) {
+/**
+ * Padded lat/lon bounding box of the track. When targetAspect (ground width /
+ * ground height) is given, the box is grown in one direction to match it so the
+ * map fills a model of that aspect without distortion.
+ */
+export function computeTrackBoundingBox(
+  points: TrackPoint[],
+  targetAspect?: number,
+  round = false
+) {
   let minLat = Infinity;
   let maxLat = -Infinity;
   let minLon = Infinity;
@@ -100,12 +127,55 @@ export function computeTrackBoundingBox(points: TrackPoint[]) {
   }
   const latPad = Math.max(0.0025, (maxLat - minLat) * 0.16);
   const lonPad = Math.max(0.0025, (maxLon - minLon) * 0.16);
-  return {
+  const box = {
     minLat: minLat - latPad,
     maxLat: maxLat + latPad,
     minLon: minLon - lonPad,
     maxLon: maxLon + lonPad,
   };
+  if (targetAspect && targetAspect > 0 && Number.isFinite(targetAspect)) {
+    const cosLat = Math.max(0.2, Math.cos((((box.minLat + box.maxLat) / 2) * Math.PI) / 180));
+    const groundW = (box.maxLon - box.minLon) * cosLat;
+    const groundH = box.maxLat - box.minLat;
+    if (groundW / groundH < targetAspect) {
+      const extra = (groundH * targetAspect) / cosLat - (box.maxLon - box.minLon);
+      box.minLon -= extra / 2;
+      box.maxLon += extra / 2;
+    } else {
+      const extra = groundW / targetAspect - groundH;
+      box.minLat -= extra / 2;
+      box.maxLat += extra / 2;
+    }
+  }
+  if (round) {
+    // Circle / hexagon bases only show the inscribed disc of the box: grow the
+    // box until every track point sits inside it with some margin
+    const cLat = (box.minLat + box.maxLat) / 2;
+    const cLon = (box.minLon + box.maxLon) / 2;
+    const hLat = (box.maxLat - box.minLat) / 2;
+    const hLon = (box.maxLon - box.minLon) / 2;
+    let maxR = 0;
+    for (const p of points) {
+      maxR = Math.max(maxR, Math.hypot((p.lon - cLon) / hLon, (p.lat - cLat) / hLat));
+    }
+    const limit = 0.78;
+    if (maxR > limit) {
+      const k = maxR / limit;
+      box.minLat = cLat - hLat * k;
+      box.maxLat = cLat + hLat * k;
+      box.minLon = cLon - hLon * k;
+      box.maxLon = cLon + hLon * k;
+    }
+  }
+  return box;
+}
+
+/** Ground aspect (width / height) of the padded track bounding box */
+export function computeTrackAspect(points: TrackPoint[]): number {
+  if (points.length < 2) return 1;
+  const b = computeTrackBoundingBox(points);
+  const cosLat = Math.max(0.2, Math.cos((((b.minLat + b.maxLat) / 2) * Math.PI) / 180));
+  return ((b.maxLon - b.minLon) * cosLat) / Math.max(1e-9, b.maxLat - b.minLat);
 }
 
 /**
@@ -114,7 +184,8 @@ export function computeTrackBoundingBox(points: TrackPoint[]) {
 async function fetchStitchedTileCanvas(
   bbox: { minLat: number; maxLat: number; minLon: number; maxLon: number },
   urlBuilder: (z: number, x: number, y: number) => string,
-  outSize = 512
+  outSize = 512,
+  smoothing = true
 ): Promise<HTMLCanvasElement> {
   let chosenZ = 13;
   for (let z = 14; z >= 9; z -= 1) {
@@ -168,7 +239,10 @@ async function fetchStitchedTileCanvas(
   const outCanvas = document.createElement('canvas');
   outCanvas.width = outSize;
   outCanvas.height = outSize;
-  const oCtx = outCanvas.getContext('2d')!;
+  const oCtx = outCanvas.getContext('2d', { willReadFrequently: !smoothing })!;
+  // Encoded data tiles (Terrarium DEM) must not be interpolated: blending the
+  // packed R/G/B channels of neighbouring pixels yields bogus elevations.
+  oCtx.imageSmoothingEnabled = smoothing;
   oCtx.drawImage(stitchCanvas, cropX, cropY, cropW, cropH, 0, 0, outSize, outSize);
   return outCanvas;
 }
@@ -177,9 +251,11 @@ async function fetchStitchedTileCanvas(
  * Fetches 3D terrain depth map (AWS Terrarium DEM) and satellite/topo textures
  */
 export async function fetchMap3DTerrainAndTextures(
-  points: TrackPoint[]
+  points: TrackPoint[],
+  targetAspect?: number,
+  round = false
 ): Promise<Map3DBundle> {
-  const bbox = computeTrackBoundingBox(points);
+  const bbox = computeTrackBoundingBox(points, targetAspect, round);
 
   const satPromise = fetchStitchedTileCanvas(
     bbox,
@@ -201,7 +277,8 @@ export async function fetchMap3DTerrainAndTextures(
       bbox,
       (z, x, y) =>
         `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`,
-      gridDim
+      gridDim,
+      false
     );
     const ctx = demCanvas.getContext('2d')!;
     const imgData = ctx.getImageData(0, 0, gridDim, gridDim).data;
@@ -301,49 +378,99 @@ function sampleBilinearDem(dem: DemGridData, lat: number, lon: number): number {
   return top + (bot - top) * fr;
 }
 
-const FONT_5X7: Record<string, string[]> = {
-  A: ['01110', '10001', '10001', '11111', '10001', '10001', '10001'],
-  B: ['11110', '10001', '10001', '11110', '10001', '10001', '11110'],
-  C: ['01111', '10000', '10000', '10000', '10000', '10000', '01111'],
-  D: ['11110', '10001', '10001', '10001', '10001', '10001', '11110'],
-  E: ['11111', '10000', '10000', '11110', '10000', '10000', '11111'],
-  F: ['11111', '10000', '10000', '11110', '10000', '10000', '10000'],
-  G: ['01111', '10000', '10000', '10111', '10001', '10001', '01111'],
-  H: ['10001', '10001', '10001', '11111', '10001', '10001', '10001'],
-  I: ['01110', '00100', '00100', '00100', '00100', '00100', '01110'],
-  J: ['00111', '00010', '00010', '00010', '10010', '10010', '01100'],
-  K: ['10001', '10010', '10100', '11000', '10100', '10010', '10001'],
-  L: ['10000', '10000', '10000', '10000', '10000', '10000', '11111'],
-  M: ['10001', '11011', '10101', '10101', '10001', '10001', '10001'],
-  N: ['10001', '11001', '10101', '10011', '10001', '10001', '10001'],
-  O: ['01110', '10001', '10001', '10001', '10001', '10001', '01110'],
-  P: ['11110', '10001', '10001', '11110', '10000', '10000', '10000'],
-  Q: ['01110', '10001', '10001', '10001', '10101', '10010', '01101'],
-  R: ['11110', '10001', '10001', '11110', '10100', '10010', '10001'],
-  S: ['01111', '10000', '10000', '01110', '00001', '00001', '11110'],
-  T: ['11111', '00100', '00100', '00100', '00100', '00100', '00100'],
-  U: ['10001', '10001', '10001', '10001', '10001', '10001', '01110'],
-  V: ['10001', '10001', '10001', '10001', '10001', '01010', '00100'],
-  W: ['10001', '10001', '10001', '10101', '10101', '11011', '10001'],
-  X: ['10001', '10001', '01010', '00100', '01010', '10001', '10001'],
-  Y: ['10001', '10001', '01010', '00100', '00100', '00100', '00100'],
-  Z: ['11111', '00001', '00010', '00100', '01000', '10000', '11111'],
-  '0': ['01110', '10001', '10011', '10101', '11001', '10001', '01110'],
-  '1': ['00100', '01100', '00100', '00100', '00100', '00100', '01110'],
-  '2': ['01110', '10001', '00001', '00110', '01000', '10000', '11111'],
-  '3': ['11110', '00001', '00001', '01110', '00001', '00001', '11110'],
-  '4': ['00010', '00110', '01010', '10010', '11111', '00010', '00010'],
-  '5': ['11111', '10000', '10000', '11110', '00001', '00001', '11110'],
-  '6': ['01110', '10000', '10000', '11110', '10001', '10001', '01110'],
-  '7': ['11111', '00001', '00010', '00100', '01000', '01000', '01000'],
-  '8': ['01110', '10001', '10001', '01110', '10001', '10001', '01110'],
-  '9': ['01110', '10001', '10001', '01111', '00001', '00001', '01110'],
-  '.': ['00000', '00000', '00000', '00000', '00000', '01100', '01100'],
-  '-': ['00000', '00000', '00000', '11111', '00000', '00000', '00000'],
-  ':': ['00000', '01100', '01100', '00000', '01100', '01100', '00000'],
-  '/': ['00001', '00010', '00010', '00100', '01000', '01000', '10000'],
-  ' ': ['00000', '00000', '00000', '00000', '00000', '00000', '00000'],
-};
+// Plaque typography: real vector font (Helvetiker Bold, MgOpen license, see
+// src/assets/fonts/LICENSE-helvetiker.txt). Glyph outlines come with correct
+// winding and holes, so ExtrudeGeometry produces clean, closed solids.
+let plaqueFont: Font | null = null;
+let plaqueFontCapRatio = 0.72;
+
+function getPlaqueFont(): Font {
+  if (!plaqueFont) {
+    plaqueFont = new Font(helvetikerBold as unknown as FontData);
+    // Measure the cap height of 'H' at size 1 so charHeight maps to capital height
+    const hShapes = plaqueFont.generateShapes('H', 1);
+    let maxY = 0;
+    for (const s of hShapes) {
+      for (const pt of s.getPoints()) if (pt.y > maxY) maxY = pt.y;
+    }
+    if (maxY > 0) plaqueFontCapRatio = maxY;
+  }
+  return plaqueFont;
+}
+
+// Strip accents (É -> E) and replace characters the font cannot draw
+function sanitizePlaqueText(text: string, font: Font): string {
+  const glyphs = font.data.glyphs;
+  return text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .split('')
+    .map((ch) => (ch === ' ' || ch === '\n' || glyphs[ch] ? ch : ''))
+    .join('');
+}
+
+/**
+ * Builds extruded 3D text geometry for the plaque. Each line is centered
+ * horizontally, shrunk to fit maxAllowedWidth, and its capital height is
+ * vertically centered on line.centerY. The text is sunk slightly into the
+ * plaque so it fuses with the base when sliced.
+ */
+function buildTextGeometry(
+  lines: Array<{ text: string; charHeight: number; centerY: number }>,
+  maxAllowedWidth: number,
+  baseZ: number,
+  embossHeight = 1.2
+): THREE.BufferGeometry | null {
+  const font = getPlaqueFont();
+  const sinkDepth = 0.2;
+  const allGeoms: THREE.BufferGeometry[] = [];
+
+  for (const line of lines) {
+    const text = sanitizePlaqueText(line.text, font);
+    if (!text.trim()) continue;
+
+    const emSize = line.charHeight / plaqueFontCapRatio;
+    const shapes = font.generateShapes(text, emSize);
+    if (shapes.length === 0) continue;
+
+    const geom = new THREE.ExtrudeGeometry(shapes, {
+      depth: embossHeight + sinkDepth,
+      bevelEnabled: false,
+      curveSegments: 6,
+    });
+    geom.computeBoundingBox();
+    const bb = geom.boundingBox!;
+    const lineW = bb.max.x - bb.min.x;
+
+    const fit = lineW > maxAllowedWidth && maxAllowedWidth > 15 ? maxAllowedWidth / lineW : 1;
+    const capH = line.charHeight * fit;
+
+    geom.translate(-(bb.min.x + bb.max.x) / 2, 0, 0);
+    if (fit !== 1) geom.scale(fit, fit, 1);
+    geom.translate(0, line.centerY - capH / 2, baseZ - sinkDepth);
+    allGeoms.push(geom);
+  }
+
+  if (allGeoms.length === 0) return null;
+  const merged =
+    allGeoms.length === 1 ? allGeoms[0] : BufferGeometryUtils.mergeGeometries(allGeoms);
+  if (merged !== allGeoms[0]) allGeoms.forEach((g) => g.dispose());
+  return merged;
+}
+
+function clampNum(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+/** Ground aspect (width / height) the map area must have for these options */
+export function getTargetAspect(
+  opts: Pick<Terrain3DOptions, 'baseShape' | 'modelWidthMm' | 'modelHeightMm'>
+): number {
+  if (opts.baseShape === 'circle' || opts.baseShape === 'hexagon') return 1;
+  const w = clampNum(opts.modelWidthMm || 110, 30, 300);
+  const h = clampNum(opts.modelHeightMm || 110, 30, 300);
+  return w / h;
+}
 
 // Map UV to base shapes
 function mapUvToShapeXY(
@@ -481,6 +608,8 @@ function pushBoxToBuffers(
   pushFace(p010, p000, p001, p011, [-1, 0, 0]);
 }
 
+
+
 /**
  * Builds the complete Three.js 3D scene objects with continuous track geometry,
  * realistic terrain mesh, base pedestal, and embossed title text.
@@ -514,7 +643,11 @@ export function buildTerrainSceneObjects(
         minLon: demGrid.minLon,
         maxLon: demGrid.maxLon,
       }
-    : computeTrackBoundingBox(points);
+    : computeTrackBoundingBox(
+        points,
+        getTargetAspect(opts),
+        opts.baseShape === 'circle' || opts.baseShape === 'hexagon'
+      );
 
   let minEle = Infinity;
   let maxEle = -Infinity;
@@ -535,30 +668,44 @@ export function buildTerrainSceneObjects(
     }
   }
 
-  const midLatRad = (((bbox.minLat + bbox.maxLat) / 2) * Math.PI) / 180;
-  const cosLat = Math.max(0.2, Math.cos(midLatRad));
-  const spanLon = Math.max(1e-5, (bbox.maxLon - bbox.minLon) * cosLat);
-  const spanLat = Math.max(1e-5, bbox.maxLat - bbox.minLat);
-
-  const maxSideMm = 110;
-  const aspect = spanLon / spanLat;
-  const halfW =
-    opts.baseShape === 'circle' || opts.baseShape === 'hexagon'
-      ? maxSideMm / 2
-      : aspect >= 1
-      ? maxSideMm / 2
-      : (maxSideMm * aspect) / 2;
-  const halfH =
-    opts.baseShape === 'circle' || opts.baseShape === 'hexagon'
-      ? maxSideMm / 2
-      : aspect >= 1
-      ? maxSideMm / (2 * aspect)
-      : maxSideMm / 2;
+  const isRound = opts.baseShape === 'circle' || opts.baseShape === 'hexagon';
+  const modelW = clampNum(opts.modelWidthMm || 110, 30, 300);
+  const modelH = isRound ? modelW : clampNum(opts.modelHeightMm || 110, 30, 300);
+  const halfW = modelW / 2;
+  const halfH = modelH / 2;
 
   const eleSpan = Math.max(10, maxEle - minEle);
   const maxReliefMm = 26 * opts.zExaggeration;
+  const baseZ = opts.baseThicknessMm;
   const eleToZ = (ele: number) =>
-    opts.baseThicknessMm + Math.max(0, ((ele - minEle) / eleSpan) * maxReliefMm);
+    baseZ + Math.max(0, ((ele - minEle) / eleSpan) * maxReliefMm);
+
+  const hasPlaque =
+    opts.baseShape !== 'ribbon' &&
+    opts.enablePlaqueTitle !== false &&
+    Boolean(opts.titleText.trim() || opts.showPlaqueStats);
+
+  // Plaque layout. Geometry is built in a local frame where the plaque hangs
+  // below the bottom edge (y < -edgeDist), then rotated into place.
+  const plaquePos: PlaquePosition3D = opts.plaquePosition ?? 'bottom';
+  const plaqueOnSide = plaquePos === 'left' || plaquePos === 'right';
+  const edgeHalfLen = plaqueOnSide ? halfH : halfW; // half length of the attached edge
+  const edgeDist = plaqueOnSide ? halfW : halfH; // centre -> attached edge
+  const plaqueRotation =
+    plaquePos === 'right' ? Math.PI / 2 : plaquePos === 'top' ? Math.PI : plaquePos === 'left' ? -Math.PI / 2 : 0;
+  const plaqueH = opts.showPlaqueStats
+    ? Math.max(22, opts.titleSizeMm * 2.8)
+    : Math.max(13, opts.titleSizeMm * 1.8);
+  const plaqueW = Math.min(edgeHalfLen * 1.85, Math.max(56, edgeHalfLen * 1.5));
+  const toGlobalXY = (x: number, y: number): [number, number] => {
+    const cr = Math.cos(plaqueRotation);
+    const sr = Math.sin(plaqueRotation);
+    return [x * cr - y * sr, x * sr + y * cr];
+  };
+
+  // 2D footprint of the model (mm), used to attach the keychain ring
+  const footprintPolys: Array<Array<[number, number]>> = [];
+  let footprintPath: { pts: Array<[number, number]>; halfWidth: number } | null = null;
 
   // Elevation evaluator
   const stepAnchor = Math.max(1, Math.floor(points.length / 180));
@@ -598,6 +745,10 @@ export function buildTerrainSceneObjects(
 
   let totalTriangles = 0;
 
+  // Lowest printed terrain height near (x, y), read from the actual terrain
+  // mesh nodes. Set once the terrain grid exists; null for the bare ribbon base.
+  let terrainFloorAt: ((x: number, y: number) => number) | null = null;
+
   // 1. TERRAIN & BASE MESH
   if (opts.baseShape !== 'ribbon') {
     const N = Math.max(20, Math.min(80, opts.gridSize));
@@ -626,7 +777,9 @@ export function buildTerrainSceneObjects(
         const u = (c / N) * 2 - 1;
         const [x, y] = mapUvToShapeXY(u, v, opts.baseShape, halfW, halfH);
         const ele = evalElevationAtXY(x, y);
+
         const z = eleToZ(ele);
+
         rowXYZ.push([x, y, z]);
         rowEle.push(ele);
 
@@ -638,6 +791,39 @@ export function buildTerrainSceneObjects(
       gridXYZ.push(rowXYZ);
       gridEle.push(rowEle);
       gridUV.push(rowUV);
+    }
+
+    {
+      // Bin the grid nodes so a point's surrounding mesh nodes can be found quickly
+      const cell = (2 * Math.max(halfW, halfH)) / N;
+      const radius = cell * 2;
+      const bins = new Map<string, number[]>();
+      for (let r = 0; r <= N; r += 1) {
+        for (let c = 0; c <= N; c += 1) {
+          const [x, y, z] = gridXYZ[r][c];
+          const k = `${Math.floor(x / radius)},${Math.floor(y / radius)}`;
+          let b = bins.get(k);
+          if (!b) bins.set(k, (b = []));
+          b.push(x, y, z);
+        }
+      }
+      terrainFloorAt = (x: number, y: number) => {
+        const bx = Math.floor(x / radius);
+        const by = Math.floor(y / radius);
+        let zMin = Infinity;
+        for (let i = -1; i <= 1; i += 1) {
+          for (let j = -1; j <= 1; j += 1) {
+            const b = bins.get(`${bx + i},${by + j}`);
+            if (!b) continue;
+            for (let k = 0; k < b.length; k += 3) {
+              const dx = b[k] - x;
+              const dy = b[k + 1] - y;
+              if (dx * dx + dy * dy <= radius * radius && b[k + 2] < zMin) zMin = b[k + 2];
+            }
+          }
+        }
+        return zMin === Infinity ? eleToZ(evalElevationAtXY(x, y)) : zMin;
+      };
     }
 
     // Build terrain surface vertices & quads
@@ -787,97 +973,173 @@ export function buildTerrainSceneObjects(
     displayGroup.add(baseMesh);
     exportGroup.add(baseMesh.clone());
     totalTriangles += baseIndices.length / 3;
+
+    const outline: Array<[number, number]> = [];
+    for (let c = 0; c < N; c += 1) outline.push([gridXYZ[0][c][0], gridXYZ[0][c][1]]);
+    for (let r = 0; r < N; r += 1) outline.push([gridXYZ[r][N][0], gridXYZ[r][N][1]]);
+    for (let c = N; c > 0; c -= 1) outline.push([gridXYZ[N][c][0], gridXYZ[N][c][1]]);
+    for (let r = N; r > 0; r -= 1) outline.push([gridXYZ[r][0][0], gridXYZ[r][0][1]]);
+    footprintPolys.push(outline);
+
+    if (hasPlaque) {
+      // 2b. SOLID EMBOSSED PLAQUE & CONNECTING BRIDGE (ONE CONTINUOUS MODEL)
+      // Solidly joins the base (Circle, Hexagon, or Rectangle) with the bottom plaque
+      // using a full-depth bridge so there is ZERO gap or separation.
+      const plaquePositions: number[] = [];
+      const plaqueNormals: number[] = [];
+      const plaqueIndices: number[] = [];
+
+      const halfPlaqueW = plaqueW / 2;
+
+      const plaqueYBot = -edgeDist - plaqueH;
+      const plaqueYTop = -edgeDist;
+      const plaqueZ0 = 0;
+      const plaqueZ1 = baseZ;
+
+      // 1. Plaque body platform at the bottom (South)
+      pushBoxToBuffers(
+        plaquePositions,
+        plaqueNormals,
+        plaqueIndices,
+        -halfPlaqueW,
+        plaqueYBot,
+        plaqueZ0,
+        halfPlaqueW,
+        plaqueYTop,
+        plaqueZ1
+      );
+
+      // 2. Solid connecting bridge: fills the gap between base bottom and plaque
+      // For Circle/Hexagon, extends well into the base (up to y = -halfH * 0.60)
+      // to guarantee a continuous solid connection with ZERO gap or separation.
+      const bridgeYTop = opts.baseShape === 'rectangle' ? -edgeDist + 1.5 : -edgeDist * 0.6;
+      const bridgeYBot = -edgeDist - 1.0; // overlap into plaque
+      const bridgeW = Math.min(plaqueW, edgeHalfLen * 1.45);
+      const halfBridgeW = bridgeW / 2;
+
+      pushBoxToBuffers(
+        plaquePositions,
+        plaqueNormals,
+        plaqueIndices,
+        -halfBridgeW,
+        bridgeYBot,
+        plaqueZ0,
+        halfBridgeW,
+        bridgeYTop,
+        plaqueZ1
+      );
+
+      const plaqueGeom = new THREE.BufferGeometry();
+      plaqueGeom.setAttribute('position', new THREE.Float32BufferAttribute(plaquePositions, 3));
+      plaqueGeom.setAttribute('normal', new THREE.Float32BufferAttribute(plaqueNormals, 3));
+      plaqueGeom.setIndex(plaqueIndices);
+      if (plaqueRotation !== 0) plaqueGeom.rotateZ(plaqueRotation);
+
+      const rectPoly = (x0: number, y0: number, x1: number, y1: number) =>
+        [toGlobalXY(x0, y0), toGlobalXY(x1, y0), toGlobalXY(x1, y1), toGlobalXY(x0, y1)];
+      footprintPolys.push(rectPoly(-halfPlaqueW, plaqueYBot, halfPlaqueW, plaqueYTop));
+      footprintPolys.push(rectPoly(-halfBridgeW, bridgeYBot, halfBridgeW, bridgeYTop));
+
+      const plaqueMesh = new THREE.Mesh(plaqueGeom, baseMat);
+      plaqueMesh.name = 'plaqueMesh';
+      plaqueMesh.receiveShadow = true;
+      displayGroup.add(plaqueMesh);
+      exportGroup.add(plaqueMesh.clone());
+      totalTriangles += plaqueIndices.length / 3;
+    }
   }
 
-  // 3. SILKY SMOOTH 3D TRACK (No creases, no origami folds, no self-intersections)
+  // 3. SILKY SMOOTH, TWIST-FREE 3D TRACK
+  // Completely eliminates creases, self-intersections, and origami facets.
   const rawPath: Array<{ x: number; y: number; ele: number }> = [];
   for (let i = 0; i < points.length; i += 1) {
     const p = points[i];
     const u = ((p.lon - bbox.minLon) / Math.max(1e-6, bbox.maxLon - bbox.minLon)) * 2 - 1;
     const v = ((p.lat - bbox.minLat) / Math.max(1e-6, bbox.maxLat - bbox.minLat)) * 2 - 1;
-    const [x, y] =
-      opts.baseShape === 'ribbon'
-        ? [u * halfW, v * halfH]
-        : mapUvToShapeXY(u, v, opts.baseShape, halfW, halfH);
-    rawPath.push({ x, y, ele: ptEles[i] });
+    // Same linear lat/lon -> mm mapping the terrain uses, so the track lines up
+    // with the terrain relief and texture on every base shape
+    rawPath.push({ x: u * halfW, y: v * halfH, ele: ptEles[i] });
   }
 
-  // Remove microscopic duplicate points (< 0.04mm)
-  const dedupPath: Array<{ x: number; y: number; ele: number }> = [];
+  // Filter duplicate or micro-distance points relative to track thickness
+  const minPtDist = Math.max(0.18, opts.trackWidthMm * 0.12);
+  const filteredPath: Array<{ x: number; y: number; ele: number }> = [];
   for (let i = 0; i < rawPath.length; i += 1) {
     if (i === 0) {
-      dedupPath.push(rawPath[0]);
+      filteredPath.push(rawPath[0]);
     } else {
-      const prev = dedupPath[dedupPath.length - 1];
+      const prev = filteredPath[filteredPath.length - 1];
       const cur = rawPath[i];
-      if (Math.hypot(cur.x - prev.x, cur.y - prev.y) > 0.04) {
-        dedupPath.push(cur);
+      if (Math.hypot(cur.x - prev.x, cur.y - prev.y) >= minPtDist) {
+        filteredPath.push(cur);
       }
     }
   }
 
-  if (dedupPath.length >= 2) {
-    // 1. Calculate cumulative arc length
+  if (filteredPath.length >= 2) {
+    // Curvature-aware multi-pass smoothing on XY & elevation
+    // The number of passes scales with track width so that the path radius of curvature
+    // always stays strictly larger than the track thickness, eliminating accordion crumpling.
+    const smoothness = Math.max(0, Math.min(1, opts.trackSmoothness ?? 0.7));
+    const smoothPasses = Math.max(2, Math.round(2 + smoothness * 4 + opts.trackWidthMm * 0.75));
+    const smoothAlpha = 0.35 + smoothness * 0.25;
+
+    let pathXY = filteredPath.map((p) => ({ ...p }));
+    for (let pass = 0; pass < smoothPasses; pass += 1) {
+      const nextPath = pathXY.map((p) => ({ ...p }));
+      for (let i = 1; i < pathXY.length - 1; i += 1) {
+        const prev = pathXY[i - 1];
+        const cur = pathXY[i];
+        const next = pathXY[i + 1];
+        nextPath[i].x = cur.x * (1 - smoothAlpha) + ((prev.x + next.x) * 0.5) * smoothAlpha;
+        nextPath[i].y = cur.y * (1 - smoothAlpha) + ((prev.y + next.y) * 0.5) * smoothAlpha;
+        nextPath[i].ele = cur.ele * (1 - smoothAlpha) + ((prev.ele + next.ele) * 0.5) * smoothAlpha;
+      }
+      pathXY = nextPath;
+    }
+
+    // Cumulative arc length
     const cumDist: number[] = [0];
-    for (let i = 1; i < dedupPath.length; i += 1) {
-      const prev = dedupPath[i - 1];
-      const cur = dedupPath[i];
+    for (let i = 1; i < pathXY.length; i += 1) {
+      const prev = pathXY[i - 1];
+      const cur = pathXY[i];
       cumDist.push(cumDist[i - 1] + Math.hypot(cur.x - prev.x, cur.y - prev.y));
     }
     const totalPathLen = cumDist[cumDist.length - 1];
 
-    if (totalPathLen > 0.15) {
-      // 2. Select smoothed control anchors based on trackSmoothness (0.0 to 1.0)
-      const smoothness = Math.max(0, Math.min(1, opts.trackSmoothness ?? 0.7));
-      const anchorSpacing = 0.8 + smoothness * 2.2; // 0.8mm (sharp) to 3.0mm (ultra smooth)
+    if (totalPathLen > 0.2) {
+      // Equidistant resampling: step size scaled with track width to prevent ring overlap
+      const sampleStep = Math.max(0.75, Math.min(2.5, opts.trackWidthMm * 0.65));
+      const numSegments = Math.max(36, Math.min(500, Math.round(totalPathLen / sampleStep)));
 
-      const anchorPts: THREE.Vector3[] = [];
-      anchorPts.push(new THREE.Vector3(dedupPath[0].x, dedupPath[0].y, dedupPath[0].ele));
-
-      let lastDist = 0;
-      for (let i = 1; i < dedupPath.length - 1; i += 1) {
-        const curDist = cumDist[i];
-        const prev = dedupPath[i - 1];
-        const cur = dedupPath[i];
-        const next = dedupPath[i + 1];
-        const v1x = cur.x - prev.x;
-        const v1y = cur.y - prev.y;
-        const v2x = next.x - cur.x;
-        const v2y = next.y - cur.y;
-        const l1 = Math.hypot(v1x, v1y) || 1;
-        const l2 = Math.hypot(v2x, v2y) || 1;
-        const dot = (v1x * v2x + v1y * v2y) / (l1 * l2);
-
-        const isSharpTurn = dot < 0.2; // apex of hairpin
-        if (curDist - lastDist >= anchorSpacing || isSharpTurn) {
-          anchorPts.push(new THREE.Vector3(cur.x, cur.y, cur.ele));
-          lastDist = curDist;
+      const sampledPts: Array<{ x: number; y: number; ele: number }> = [];
+      let curIdx = 0;
+      for (let i = 0; i <= numSegments; i += 1) {
+        const targetD = (i / numSegments) * totalPathLen;
+        while (curIdx < cumDist.length - 2 && cumDist[curIdx + 1] < targetD) {
+          curIdx += 1;
         }
+        const d0 = cumDist[curIdx];
+        const d1 = cumDist[curIdx + 1];
+        const segmentLen = d1 - d0;
+        const t = segmentLen > 1e-6 ? (targetD - d0) / segmentLen : 0;
+        const p0 = pathXY[curIdx];
+        const p1 = pathXY[curIdx + 1];
+
+        sampledPts.push({
+          x: p0.x + (p1.x - p0.x) * t,
+          y: p0.y + (p1.y - p0.y) * t,
+          ele: p0.ele + (p1.ele - p0.ele) * t,
+        });
       }
-      const lastPt = dedupPath[dedupPath.length - 1];
-      anchorPts.push(new THREE.Vector3(lastPt.x, lastPt.y, lastPt.ele));
 
-      // 3. Create smooth Catmull-Rom spline
-      const splineTension = 0.2;
-      const smoothSpline = new THREE.CatmullRomCurve3(
-        anchorPts,
-        false,
-        'catmullrom',
-        splineTension
-      );
-
-      // 4. Sample equidistant points along the smooth curve
-      const sampleStep = Math.max(0.45, Math.min(1.2, opts.trackWidthMm * 0.35));
-      const numSegments = Math.max(36, Math.min(480, Math.round(totalPathLen / sampleStep)));
-      const smoothCurvePts = smoothSpline.getSpacedPoints(numSegments);
-
-      // Evaluate terrain elevations and apply moving-average smoothing on Z
+      // Sample terrain surface elevation and apply moving-average Z smoothing
       const rawZ: number[] = [];
       for (let i = 0; i <= numSegments; i += 1) {
-        const p = smoothCurvePts[i];
+        const p = sampledPts[i];
         const surfEle =
           opts.baseShape === 'ribbon'
-            ? p.z
+            ? p.ele
             : evalElevationAtXY(p.x, p.y);
         rawZ.push(eleToZ(surfEle));
       }
@@ -891,11 +1153,19 @@ export function buildTerrainSceneObjects(
         }
       }
 
+      // Track bottom edge: below the lowest terrain mesh node around the point,
+      // so the track fuses into the terrain and never rests on or above it
+      const trackSink = 0.5;
+      const edgeBottomZ = (x: number, y: number, zSurf: number) => {
+        if (!terrainFloorAt) return 0;
+        return Math.max(0.2, Math.min(zSurf, terrainFloorAt(x, y)) - trackSink);
+      };
+
       let trackGeom: THREE.BufferGeometry;
 
       if (opts.trackStyle === 'ribbon') {
-        // --- SMOOTH BEVELED RIBBON ---
-        const halfW = opts.trackWidthMm * 0.5;
+        // --- SMOOTH BEVELED RIBBON (Twist-Free Orthonormal Framing) ---
+        const halfWidth = opts.trackWidthMm * 0.5;
         const extrudeH = opts.trackHeightMm;
 
         const ribbonPositions: number[] = [];
@@ -912,41 +1182,67 @@ export function buildTerrainSceneObjects(
         const sections: RibbonCrossSection[] = [];
 
         for (let i = 0; i <= numSegments; i += 1) {
-          const cur = smoothCurvePts[i];
+          const cur = sampledPts[i];
           const zSurf = smoothedZ[i];
 
           let tx = 0;
           let ty = 0;
           if (i === 0) {
-            const next = smoothCurvePts[1];
+            const next = sampledPts[1];
             const l = Math.hypot(next.x - cur.x, next.y - cur.y) || 1;
             tx = (next.x - cur.x) / l;
             ty = (next.y - cur.y) / l;
           } else if (i === numSegments) {
-            const prev = smoothCurvePts[numSegments - 1];
+            const prev = sampledPts[numSegments - 1];
             const l = Math.hypot(cur.x - prev.x, cur.y - prev.y) || 1;
             tx = (cur.x - prev.x) / l;
             ty = (cur.y - prev.y) / l;
           } else {
-            const prev = smoothCurvePts[i - 1];
-            const next = smoothCurvePts[i + 1];
+            const prev = sampledPts[i - 1];
+            const next = sampledPts[i + 1];
             const l = Math.hypot(next.x - prev.x, next.y - prev.y) || 1;
             tx = (next.x - prev.x) / l;
             ty = (next.y - prev.y) / l;
           }
 
-          const nx = -ty * halfW;
-          const ny = tx * halfW;
+          const nx = -ty * halfWidth;
+          const ny = tx * halfWidth;
 
           const zTop = zSurf + extrudeH;
-          const zBot = opts.baseShape === 'ribbon' ? 0 : Math.max(0.2, zSurf - 0.4);
+          const zBotL = edgeBottomZ(cur.x + nx, cur.y + ny, zSurf);
+          const zBotR = edgeBottomZ(cur.x - nx, cur.y - ny, zSurf);
 
-          sections.push({
-            LTop: [cur.x + nx, cur.y + ny, zTop],
-            RTop: [cur.x - nx, cur.y - ny, zTop],
-            LBot: [cur.x + nx, cur.y + ny, zBot],
-            RBot: [cur.x - nx, cur.y - ny, zBot],
-          });
+          let LTop: [number, number, number] = [cur.x + nx, cur.y + ny, zTop];
+          let RTop: [number, number, number] = [cur.x - nx, cur.y - ny, zTop];
+          let LBot: [number, number, number] = [cur.x + nx, cur.y + ny, zBotL];
+          let RBot: [number, number, number] = [cur.x - nx, cur.y - ny, zBotR];
+
+          // Anti-inversion guard: prevents inner edge from folding backwards at sharp bends
+          if (sections.length > 0) {
+            const prev = sections[sections.length - 1];
+            const pPrev = sampledPts[i - 1];
+            const segDx = cur.x - pPrev.x;
+            const segDy = cur.y - pPrev.y;
+            const segL = Math.hypot(segDx, segDy) || 1e-5;
+            const fwdX = segDx / segL;
+            const fwdY = segDy / segL;
+
+            const dL = (LTop[0] - prev.LTop[0]) * fwdX + (LTop[1] - prev.LTop[1]) * fwdY;
+            if (dL < segL * 0.15) {
+              const push = segL * 0.15 - dL;
+              LTop = [LTop[0] + fwdX * push, LTop[1] + fwdY * push, zTop];
+              LBot = [LBot[0] + fwdX * push, LBot[1] + fwdY * push, zBotL];
+            }
+
+            const dR = (RTop[0] - prev.RTop[0]) * fwdX + (RTop[1] - prev.RTop[1]) * fwdY;
+            if (dR < segL * 0.15) {
+              const push = segL * 0.15 - dR;
+              RTop = [RTop[0] + fwdX * push, RTop[1] + fwdY * push, zTop];
+              RBot = [RBot[0] + fwdX * push, RBot[1] + fwdY * push, zBotR];
+            }
+          }
+
+          sections.push({ LTop, RTop, LBot, RBot });
         }
 
         for (let i = 0; i < sections.length - 1; i += 1) {
@@ -962,7 +1258,10 @@ export function buildTerrainSceneObjects(
             const v0 = new THREE.Vector3(...p0);
             const v1 = new THREE.Vector3(...p1);
             const v2 = new THREE.Vector3(...p2);
-            const n = new THREE.Vector3().subVectors(v1, v0).cross(new THREE.Vector3().subVectors(v2, v0)).normalize();
+            const n = new THREE.Vector3()
+              .subVectors(v1, v0)
+              .cross(new THREE.Vector3().subVectors(v2, v0))
+              .normalize();
 
             const baseIdx = ribbonPositions.length / 3;
             ribbonPositions.push(...p0, ...p1, ...p2, ...p3);
@@ -970,13 +1269,16 @@ export function buildTerrainSceneObjects(
             ribbonIndices.push(baseIdx, baseIdx + 1, baseIdx + 2, baseIdx, baseIdx + 2, baseIdx + 3);
           };
 
+          // Top
           pushQuad(s0.LTop, s0.RTop, s1.RTop, s1.LTop);
+          // Bottom
           pushQuad(s0.LBot, s1.LBot, s1.RBot, s0.RBot);
+          // Left
           pushQuad(s0.LBot, s0.LTop, s1.LTop, s1.LBot);
+          // Right
           pushQuad(s0.RTop, s0.RBot, s1.RBot, s1.RTop);
         }
 
-        const sStart = sections[0];
         const pushCap = (
           p0: [number, number, number],
           p1: [number, number, number],
@@ -986,15 +1288,19 @@ export function buildTerrainSceneObjects(
           const v0 = new THREE.Vector3(...p0);
           const v1 = new THREE.Vector3(...p1);
           const v2 = new THREE.Vector3(...p2);
-          const n = new THREE.Vector3().subVectors(v1, v0).cross(new THREE.Vector3().subVectors(v2, v0)).normalize();
+          const n = new THREE.Vector3()
+            .subVectors(v1, v0)
+            .cross(new THREE.Vector3().subVectors(v2, v0))
+            .normalize();
 
           const baseIdx = ribbonPositions.length / 3;
           ribbonPositions.push(...p0, ...p1, ...p2, ...p3);
           ribbonNormals.push(n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z);
           ribbonIndices.push(baseIdx, baseIdx + 1, baseIdx + 2, baseIdx, baseIdx + 2, baseIdx + 3);
         };
-        pushCap(sStart.LBot, sStart.RBot, sStart.RTop, sStart.LTop);
 
+        const sStart = sections[0];
+        pushCap(sStart.LBot, sStart.RBot, sStart.RTop, sStart.LTop);
         const sEnd = sections[sections.length - 1];
         pushCap(sEnd.RBot, sEnd.LBot, sEnd.LTop, sEnd.RTop);
 
@@ -1004,62 +1310,121 @@ export function buildTerrainSceneObjects(
         trackGeom.setIndex(ribbonIndices);
         trackGeom.computeVertexNormals();
       } else {
-        // --- SMOOTH 3D TUBE / PIPE (Default, Recommended for 3D Printing) ---
-        const tubeRadius = Math.max(0.6, opts.trackWidthMm * 0.5);
-        const tubeElevOffset =
-          opts.baseShape === 'ribbon'
-            ? opts.trackHeightMm
-            : Math.max(0.3, opts.trackHeightMm * 0.35);
+        // --- GROUNDED ROUNDED-TOP TRACK ---
+        // Cross-section: flat bottom sunk into the terrain, vertical walls and a
+        // half-round (elliptical when low) top. It sits on the surface, so nothing
+        // overhangs when printed. Z stays up, so the extrusion cannot twist.
+        const halfWidth = Math.max(0.5, opts.trackWidthMm * 0.5);
+        const trackH = opts.trackHeightMm;
+        const capRy = Math.min(halfWidth, trackH);
+        const wallTop = trackH - capRy;
+        const arcSteps = 12;
 
-        const centerline3D: THREE.Vector3[] = [];
+        // Profile: right-bottom, arc over the top from right to left, left-bottom.
+        // o = lateral offset (+ = left of travel), dz = height above the surface.
+        const profile: Array<{ o: number; dz: number; bottom: boolean }> = [
+          { o: -halfWidth, dz: 0, bottom: true },
+        ];
+        for (let k = 0; k <= arcSteps; k += 1) {
+          const a = (k / arcSteps) * Math.PI;
+          profile.push({
+            o: -halfWidth * Math.cos(a),
+            dz: wallTop + capRy * Math.sin(a),
+            bottom: false,
+          });
+        }
+        profile.push({ o: halfWidth, dz: 0, bottom: true });
+        const P = profile.length;
+
+        const tubePositions: number[] = [];
+        const tubeIndices: number[] = [];
+        const capCenters: Array<[number, number, number]> = [];
+
         for (let i = 0; i <= numSegments; i += 1) {
-          const p = smoothCurvePts[i];
-          centerline3D.push(new THREE.Vector3(p.x, p.y, smoothedZ[i] + tubeElevOffset));
+          const cur = sampledPts[i];
+          const prev = sampledPts[Math.max(0, i - 1)];
+          const next = sampledPts[Math.min(numSegments, i + 1)];
+          const l = Math.hypot(next.x - prev.x, next.y - prev.y) || 1;
+          const tx = (next.x - prev.x) / l;
+          const ty = (next.y - prev.y) / l;
+          const nx = -ty;
+          const ny = tx;
+          const zSurf = smoothedZ[i];
+
+          // Bottom of each side follows the terrain under that side
+          const zBotR = edgeBottomZ(cur.x - nx * halfWidth, cur.y - ny * halfWidth, zSurf);
+          const zBotL = edgeBottomZ(cur.x + nx * halfWidth, cur.y + ny * halfWidth, zSurf);
+
+          let fwdX = 0;
+          let fwdY = 0;
+          let segL = 0;
+          if (i > 0) {
+            const segDx = cur.x - prev.x;
+            const segDy = cur.y - prev.y;
+            segL = Math.hypot(segDx, segDy) || 1e-5;
+            fwdX = segDx / segL;
+            fwdY = segDy / segL;
+          }
+
+          let cx = 0;
+          let cy = 0;
+          let cz = 0;
+          for (let j = 0; j < P; j += 1) {
+            const pr = profile[j];
+            let vx = cur.x + nx * pr.o;
+            let vy = cur.y + ny * pr.o;
+            const vz = pr.bottom ? (pr.o < 0 ? zBotR : zBotL) : zSurf + pr.dz;
+
+            // Anti-inversion guard: keeps the inner side of tight bends from folding back
+            if (i > 0) {
+              const pi = ((i - 1) * P + j) * 3;
+              const d = (vx - tubePositions[pi]) * fwdX + (vy - tubePositions[pi + 1]) * fwdY;
+              if (d < segL * 0.15) {
+                const push = segL * 0.15 - d;
+                vx += fwdX * push;
+                vy += fwdY * push;
+              }
+            }
+            tubePositions.push(vx, vy, vz);
+            cx += vx;
+            cy += vy;
+            cz += vz;
+          }
+          if (i === 0 || i === numSegments) capCenters.push([cx / P, cy / P, cz / P]);
         }
 
-        const path3D = new THREE.CatmullRomCurve3(centerline3D, false, 'catmullrom', 0.15);
-        const radialSegments = 12;
-        const tube = new THREE.TubeGeometry(
-          path3D,
-          numSegments,
-          tubeRadius,
-          radialSegments,
-          false
-        );
-
-        // Add watertight circular end caps at start and end
-        const tubePos = Array.from(tube.attributes.position.array);
-        const tubeIdx = Array.from(tube.index!.array);
-
-        // Start cap: ring 0 (vertices 0..radialSegments)
-        const centerStartIdx = tubePos.length / 3;
-        const startPt = centerline3D[0];
-        tubePos.push(startPt.x, startPt.y, startPt.z);
-        for (let j = 0; j < radialSegments; j += 1) {
-          tubeIdx.push(centerStartIdx, j + 1, j);
+        // Side walls: outward winding (profile runs counter-clockwise seen from behind)
+        for (let i = 0; i < numSegments; i += 1) {
+          const a = i * P;
+          const b = (i + 1) * P;
+          for (let j = 0; j < P; j += 1) {
+            const j1 = (j + 1) % P;
+            tubeIndices.push(a + j, b + j, a + j1);
+            tubeIndices.push(a + j1, b + j, b + j1);
+          }
         }
 
-        // End cap: ring numSegments
-        const centerEndIdx = tubePos.length / 3;
-        const endPt = centerline3D[centerline3D.length - 1];
-        tubePos.push(endPt.x, endPt.y, endPt.z);
-        const endRingBase = numSegments * (radialSegments + 1);
-        for (let j = 0; j < radialSegments; j += 1) {
-          tubeIdx.push(centerEndIdx, endRingBase + j, endRingBase + j + 1);
-        }
+        // End caps (fan from the profile centroid)
+        const startC = tubePositions.length / 3;
+        tubePositions.push(...capCenters[0]);
+        for (let j = 0; j < P; j += 1) tubeIndices.push(startC, j, (j + 1) % P);
+        const endC = tubePositions.length / 3;
+        tubePositions.push(...capCenters[1]);
+        const endBase = numSegments * P;
+        for (let j = 0; j < P; j += 1) tubeIndices.push(endC, endBase + ((j + 1) % P), endBase + j);
 
         trackGeom = new THREE.BufferGeometry();
-        trackGeom.setAttribute('position', new THREE.Float32BufferAttribute(tubePos, 3));
-        trackGeom.setIndex(tubeIdx);
+        trackGeom.setAttribute('position', new THREE.Float32BufferAttribute(tubePositions, 3));
+        trackGeom.setIndex(tubeIndices);
         trackGeom.computeVertexNormals();
       }
-
       const trackMat = new THREE.MeshStandardMaterial({
         color: palette.track,
         roughness: 0.32,
         metalness: 0.22,
         emissive: palette.track,
         emissiveIntensity: 0.18,
+        side: THREE.DoubleSide,
       });
 
       const trackMesh = new THREE.Mesh(trackGeom, trackMat);
@@ -1069,184 +1434,266 @@ export function buildTerrainSceneObjects(
       exportGroup.add(trackMesh.clone());
       totalTriangles += trackGeom.index!.count / 3;
 
-      // 4. Start & Finish Marker Pins (if enabled)
+      footprintPath = {
+        pts: sampledPts.map((p) => [p.x, p.y] as [number, number]),
+        halfWidth: opts.trackWidthMm * 0.5,
+      };
+
+      // 4. Start & Finish markers: low domes centred on the track, standing on
+      // the terrain (flat sunk base, vertical wall, rounded top). No overhang.
       if (opts.showMarkers) {
-        const markerRadius = Math.max(1.4, opts.trackWidthMm * 0.75);
-        const startPt = smoothCurvePts[0];
-        const startZ = smoothedZ[0] + opts.trackHeightMm + markerRadius * 0.8;
+        const markerRadius = Math.max(1.4, opts.trackWidthMm * 0.85);
+        const domeRise = opts.trackHeightMm + 0.6; // a little prouder than the track
 
-        const startPinGeom = new THREE.SphereGeometry(markerRadius, 14, 10);
-        startPinGeom.translate(startPt.x, startPt.y, startZ);
-        const startPinMat = new THREE.MeshStandardMaterial({
-          color: new THREE.Color('#22c55e'),
-          roughness: 0.3,
-          metalness: 0.2,
-          emissive: new THREE.Color('#15803d'),
-          emissiveIntensity: 0.2,
-        });
-        const startPinMesh = new THREE.Mesh(startPinGeom, startPinMat);
-        displayGroup.add(startPinMesh);
-        exportGroup.add(startPinMesh.clone());
-        totalTriangles += startPinGeom.index!.count / 3;
+        const buildMarker = (idx: number, color: string, emissive: string) => {
+          const pt = sampledPts[idx];
+          const zSurf = smoothedZ[idx];
+          let zBottom = 0;
+          if (terrainFloorAt) {
+            zBottom = Math.min(zSurf, terrainFloorAt(pt.x, pt.y));
+            for (let k = 0; k < 8; k += 1) {
+              const a = (k / 8) * Math.PI * 2;
+              const x = pt.x + Math.cos(a) * markerRadius;
+              const y = pt.y + Math.sin(a) * markerRadius;
+              zBottom = Math.min(zBottom, terrainFloorAt(x, y));
+            }
+            zBottom = Math.max(0.2, zBottom - 0.5);
+          }
 
-        const endPt = smoothCurvePts[numSegments];
-        const endZ = smoothedZ[numSegments] + opts.trackHeightMm + markerRadius * 0.8;
-        const endPinGeom = new THREE.SphereGeometry(markerRadius, 14, 10);
-        endPinGeom.translate(endPt.x, endPt.y, endZ);
-        const endPinMat = new THREE.MeshStandardMaterial({
-          color: new THREE.Color('#ef4444'),
-          roughness: 0.3,
-          metalness: 0.2,
-          emissive: new THREE.Color('#b91c1c'),
-          emissiveIntensity: 0.2,
-        });
-        const endPinMesh = new THREE.Mesh(endPinGeom, endPinMat);
-        displayGroup.add(endPinMesh);
-        exportGroup.add(endPinMesh.clone());
-        totalTriangles += endPinGeom.index!.count / 3;
+          // Lathe profile in (radius, z); revolved around Y then turned Z-up
+          const prof: THREE.Vector2[] = [new THREE.Vector2(0, zBottom)];
+          prof.push(new THREE.Vector2(markerRadius, zBottom));
+          prof.push(new THREE.Vector2(markerRadius, zSurf));
+          const steps = 8;
+          for (let k = 1; k <= steps; k += 1) {
+            const a = (k / steps) * (Math.PI / 2);
+            prof.push(
+              new THREE.Vector2(
+                k === steps ? 0 : markerRadius * Math.cos(a),
+                zSurf + domeRise * Math.sin(a)
+              )
+            );
+          }
+          const geom = new THREE.LatheGeometry(prof, 20);
+          geom.rotateX(Math.PI / 2);
+          geom.translate(pt.x, pt.y, 0);
+
+          const mat = new THREE.MeshStandardMaterial({
+            color: new THREE.Color(color),
+            roughness: 0.3,
+            metalness: 0.2,
+            emissive: new THREE.Color(emissive),
+            emissiveIntensity: 0.2,
+          });
+          const mesh = new THREE.Mesh(geom, mat);
+          mesh.castShadow = true;
+          displayGroup.add(mesh);
+          exportGroup.add(mesh.clone());
+          totalTriangles += geom.index ? geom.index.count / 3 : geom.getAttribute('position').count / 3;
+        };
+
+        buildMarker(0, '#22c55e', '#15803d');
+        buildMarker(numSegments, '#ef4444', '#b91c1c');
       }
     }
   }
+  // 4. EMBOSSED 3D TITLE & STATS ON THE INTEGRATED PLAQUE PLATFORM
+  // Solid continuous vector strokes sitting directly on the connected front plaque
+  const cleanTitle = opts.titleText.trim().toUpperCase().slice(0, 26);
+  const dateStr = (opts.titleDateText || '').trim().toUpperCase().slice(0, 16);
+  const distStr = (opts.titleDistanceText || '').trim().toUpperCase().slice(0, 12);
+  const durStr = (opts.titleDurationText || '').trim().toUpperCase().slice(0, 12);
+  const eleStr = (opts.titleElevationText || '').trim().toUpperCase().slice(0, 10);
 
-  // 4. 3D TITLE PLAQUE & EMBOSSED TEXT (Fixes text inside model bug)
-  const cleanTitle = opts.titleText.trim().toUpperCase().slice(0, 24);
-  if (cleanTitle.length > 0 && opts.baseShape !== 'ribbon') {
-    const charHeight = opts.titleSizeMm;
-    const pixelSize = charHeight / 7;
-    const charWidth = 5 * pixelSize;
-    const charGap = 1.4 * pixelSize;
-    const totalTextW = cleanTitle.length * (charWidth + charGap) - charGap;
+  const linesToRender: Array<{ text: string; charHeight: number; centerY: number }> = [];
 
-    const plaqueW = Math.min(halfW * 1.9, Math.max(totalTextW + 12, 48));
-    const plaqueH = charHeight + 6;
+  const plaqueYTop = -edgeDist;
 
-    // Plaque sits at the front (South edge: -halfH) firmly outside/in front of the model
-    const plaqueY0 = -halfH - plaqueH + 1.0;
-    const plaqueY1 = -halfH + 1.0;
-    const plaqueZ0 = 0;
-    const plaqueZ1 = opts.baseThicknessMm + 0.6;
+  if (
+    hasPlaque &&
+    (cleanTitle.length > 0 || (opts.showPlaqueStats && (dateStr || distStr || eleStr)))
+  ) {
+    if (opts.showPlaqueStats) {
+      // Line 1: Main Title
+      const h1 = Math.max(3.8, Math.min(6.2, opts.titleSizeMm));
+      // Line 2: Date • Distance
+      const line2Parts = [dateStr, distStr].filter(Boolean);
+      const line2 = line2Parts.join('  •  ');
+      const h2 = Math.max(2.6, h1 * 0.62);
+      // Line 3: Duration • Max Altitude
+      const line3Parts = [durStr, eleStr ? `MAX ALT ${eleStr}` : ''].filter(Boolean);
+      const line3 = line3Parts.join('  •  ');
+      const h3 = Math.max(2.6, h1 * 0.62);
 
-    const plaquePositions: number[] = [];
-    const plaqueNormals: number[] = [];
-    const plaqueIndices: number[] = [];
+      const y1 = plaqueYTop - plaqueH * 0.26;
+      const y2 = plaqueYTop - plaqueH * 0.56;
+      const y3 = plaqueYTop - plaqueH * 0.82;
 
-    pushBoxToBuffers(
-      plaquePositions,
-      plaqueNormals,
-      plaqueIndices,
-      -plaqueW / 2,
-      plaqueY0,
-      plaqueZ0,
-      plaqueW / 2,
-      plaqueY1,
-      plaqueZ1
-    );
-
-    const plaqueGeom = new THREE.BufferGeometry();
-    plaqueGeom.setAttribute(
-      'position',
-      new THREE.Float32BufferAttribute(plaquePositions, 3)
-    );
-    plaqueGeom.setAttribute(
-      'normal',
-      new THREE.Float32BufferAttribute(plaqueNormals, 3)
-    );
-    plaqueGeom.setIndex(plaqueIndices);
-
-    const plaqueMat = new THREE.MeshStandardMaterial({
-      color: palette.base.clone().multiplyScalar(0.75),
-      roughness: 0.5,
-      metalness: 0.2,
-    });
-
-    const plaqueMesh = new THREE.Mesh(plaqueGeom, plaqueMat);
-    plaqueMesh.name = 'plaqueMesh';
-    displayGroup.add(plaqueMesh);
-    exportGroup.add(plaqueMesh.clone());
-    totalTriangles += plaqueIndices.length / 3;
-
-    // Embossed 3D Letter Glyphs standing PROUDLY on top of the plaque (Z = plaqueZ1 to plaqueZ1 + 1.6)
-    const textPositions: number[] = [];
-    const textNormals: number[] = [];
-    const textIndices: number[] = [];
-
-    const startX = -totalTextW / 2;
-    const startY = plaqueY0 + (plaqueH - charHeight) / 2;
-    const letterZ0 = plaqueZ1;
-    const letterZ1 = plaqueZ1 + 1.5; // Raised 1.5mm above plaque face
-
-    for (let cIdx = 0; cIdx < cleanTitle.length; cIdx += 1) {
-      const ch = cleanTitle[cIdx];
-      const glyph = FONT_5X7[ch];
-      if (!glyph) continue;
-
-      const charX = startX + cIdx * (charWidth + charGap);
-
-      for (let r = 0; r < 7; r += 1) {
-        const rowStr = glyph[6 - r];
-        for (let col = 0; col < 5; col += 1) {
-          if (rowStr[col] === '1') {
-            const px0 = charX + col * pixelSize;
-            const py0 = startY + r * pixelSize;
-            const px1 = px0 + pixelSize * 0.94;
-            const py1 = py0 + pixelSize * 0.94;
-
-            pushBoxToBuffers(
-              textPositions,
-              textNormals,
-              textIndices,
-              px0,
-              py0,
-              letterZ0,
-              px1,
-              py1,
-              letterZ1
-            );
-          }
-        }
-      }
+      if (cleanTitle) linesToRender.push({ text: cleanTitle, charHeight: h1, centerY: y1 });
+      if (line2) linesToRender.push({ text: line2, charHeight: h2, centerY: y2 });
+      if (line3) linesToRender.push({ text: line3, charHeight: h3, centerY: y3 });
+    } else if (cleanTitle.length > 0) {
+      // Single Title Line centered on the plaque
+      const h1 = Math.max(4.5, Math.min(8.0, opts.titleSizeMm));
+      const centerY = plaqueYTop - plaqueH * 0.50;
+      linesToRender.push({ text: cleanTitle, charHeight: h1, centerY });
     }
+  }
 
-    if (textIndices.length > 0) {
-      const textGeom = new THREE.BufferGeometry();
-      textGeom.setAttribute(
-        'position',
-        new THREE.Float32BufferAttribute(textPositions, 3)
-      );
-      textGeom.setAttribute(
-        'normal',
-        new THREE.Float32BufferAttribute(textNormals, 3)
-      );
-      textGeom.setIndex(textIndices);
+  const maxAllowedW = plaqueW - 8;
 
+  if (linesToRender.length > 0) {
+    const textGeom = buildTextGeometry(linesToRender, maxAllowedW, baseZ, 1.2);
+    if (textGeom) {
+      if (plaquePos === 'top') {
+        // Keep the text upright for a viewer in front: move it to the top plaque unrotated
+        textGeom.translate(0, 2 * edgeDist + plaqueH, 0);
+      } else if (plaqueRotation !== 0) {
+        // Side plaques: text runs along the edge, letters' tops facing the map
+        textGeom.rotateZ(plaqueRotation);
+      }
       const textMat = new THREE.MeshStandardMaterial({
         color: palette.track,
         roughness: 0.3,
-        metalness: 0.3,
+        metalness: 0.25,
         emissive: palette.track,
-        emissiveIntensity: 0.12,
+        emissiveIntensity: 0.15,
       });
 
       const textMesh = new THREE.Mesh(textGeom, textMat);
       textMesh.name = 'textMesh';
+      textMesh.castShadow = true;
       displayGroup.add(textMesh);
       exportGroup.add(textMesh.clone());
-      totalTriangles += textIndices.length / 3;
+      totalTriangles += textGeom.index
+        ? textGeom.index.count / 3
+        : textGeom.getAttribute('position').count / 3;
     }
   }
+
+  // 5. KEYCHAIN RING: flat ring on the print bed, pushed out along the chosen
+  // compass angle until its hole clears the model, so only the band overlaps it
+  if (opts.keychainEnabled && (footprintPolys.length > 0 || footprintPath)) {
+    const outerR = clampNum((opts.keychainOuterDiameterMm ?? 14) / 2, 3, 20);
+    const innerR = clampNum((opts.keychainHoleDiameterMm ?? 6) / 2, 1, outerR - 1.2);
+    const thickness = clampNum(opts.keychainThicknessMm ?? 3, 1, 15);
+    const clearance = 0.6;
+    const angleRad = ((opts.keychainAngleDeg ?? 360) * Math.PI) / 180;
+    const dirX = Math.sin(angleRad);
+    const dirY = Math.cos(angleRad);
+
+    const distToFootprint = (x: number, y: number): number => {
+      let best = Infinity;
+      for (const poly of footprintPolys) {
+        if (pointInPolygon(x, y, poly)) return 0;
+        for (let k = 0; k < poly.length; k += 1) {
+          const a = poly[k];
+          const b = poly[(k + 1) % poly.length];
+          best = Math.min(best, distToSegment(x, y, a[0], a[1], b[0], b[1]));
+        }
+      }
+      if (footprintPath) {
+        const pts = footprintPath.pts;
+        for (let k = 0; k < pts.length - 1; k += 1) {
+          const d =
+            distToSegment(x, y, pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1]) -
+            footprintPath.halfWidth;
+          best = Math.min(best, Math.max(0, d));
+        }
+      }
+      return best;
+    };
+
+    // Ray origin: model centre, or for a bare track the track point furthest along the ray
+    let ox = 0;
+    let oy = 0;
+    if (footprintPolys.length === 0 && footprintPath) {
+      let bestDot = -Infinity;
+      for (const [x, y] of footprintPath.pts) {
+        const d = x * dirX + y * dirY;
+        if (d > bestDot) {
+          bestDot = d;
+          ox = x;
+          oy = y;
+        }
+      }
+    }
+
+    const required = innerR + clearance;
+    const step = 0.25;
+    let t = Math.max(halfW, halfH) * 2 + (hasPlaque ? plaqueH : 0) + outerR + 10;
+    while (t > 0 && distToFootprint(ox + dirX * (t - step), oy + dirY * (t - step)) >= required) {
+      t -= step;
+    }
+    const ringX = ox + dirX * t;
+    const ringY = oy + dirY * t;
+
+    const ringShape = new THREE.Shape();
+    ringShape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
+    const ringHole = new THREE.Path();
+    ringHole.absarc(0, 0, innerR, 0, Math.PI * 2, true);
+    ringShape.holes.push(ringHole);
+    const ringGeom = new THREE.ExtrudeGeometry(ringShape, {
+      depth: thickness,
+      bevelEnabled: false,
+      curveSegments: 32,
+    });
+    ringGeom.translate(ringX, ringY, 0);
+
+    const ringMat = new THREE.MeshStandardMaterial({
+      color: opts.baseShape === 'ribbon' ? palette.track : palette.base,
+      roughness: 0.65,
+      metalness: 0.15,
+    });
+    const ringMesh = new THREE.Mesh(ringGeom, ringMat);
+    ringMesh.name = 'keychainRing';
+    ringMesh.castShadow = true;
+    ringMesh.receiveShadow = true;
+    displayGroup.add(ringMesh);
+    exportGroup.add(ringMesh.clone());
+    totalTriangles += ringGeom.getAttribute('position').count / 3;
+  }
+
+  // Measure the real printed extents (base, plaque, track, ring)
+  const extents = new THREE.Box3().setFromObject(exportGroup);
+  const size = extents.isEmpty() ? new THREE.Vector3() : extents.getSize(new THREE.Vector3());
 
   return {
     displayGroup,
     exportGroup,
     stats: {
-      triangleCount: totalTriangles,
-      widthMm: Math.round(halfW * 2),
-      lengthMm: Math.round(halfH * 2),
-      heightMm: Math.round(opts.baseThicknessMm + maxReliefMm + opts.trackHeightMm),
+      triangleCount: Math.round(totalTriangles),
+      widthMm: Math.round(size.x),
+      lengthMm: Math.round(size.y),
+      heightMm: Math.round(size.z),
     },
   };
 }
 
+function pointInPolygon(x: number, y: number, poly: Array<[number, number]>): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i, i += 1) {
+    const [xi, yi] = poly[i];
+    const [xj, yj] = poly[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function distToSegment(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number
+): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  const t = len2 > 0 ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2)) : 0;
+  return Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
+}
 /**
  * Export the combined 3D meshes as a watertight binary STL Blob for 3D printing
  */

@@ -1000,6 +1000,36 @@ button:disabled {
   box-shadow: 0 24px 48px rgba(0, 0, 0, 0.6);
 }
 
+/* Themed scrollbars for the GPX to 3D studio (replaces the OS default look) */
+.studio-3d-modal,
+.studio-3d-modal * {
+  scrollbar-width: thin;
+  scrollbar-color: #334155 transparent;
+}
+
+.studio-3d-modal ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.studio-3d-modal ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.studio-3d-modal ::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 8px;
+  border: 2px solid var(--bg-panel);
+}
+
+.studio-3d-modal ::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+.studio-3d-modal ::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 .share-modal-header {
   display: flex;
   align-items: center;
