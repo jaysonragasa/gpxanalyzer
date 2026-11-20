@@ -1,6 +1,7 @@
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import {
   Archive,
+  Box,
   Compass,
   Download,
   FilePlus2,
@@ -41,6 +42,7 @@ import { Sidebar } from './components/Sidebar';
 import { ArchiveMap } from './components/ArchiveMap';
 import { ArchiveSidebar } from './components/ArchiveSidebar';
 import { ShareCardModal } from './components/ShareCardModal';
+import { GpxTo3DModal } from './components/GpxTo3DModal';
 import { fetchTerrainElevations } from './utils/elevationApi';
 import {
   ArchiveActivity,
@@ -80,6 +82,7 @@ export function App() {
   const [speedMin, setSpeedMin] = useState('25');
   const [speedMax, setSpeedMax] = useState('49');
   const [showShareCard, setShowShareCard] = useState(false);
+  const [show3DModal, setShow3DModal] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mergeInputRef = useRef<HTMLInputElement | null>(null);
@@ -996,6 +999,16 @@ export function App() {
           <button className="btn-ghost" onClick={handleLoadSample}>
             <span>Sample</span>
           </button>
+          <button
+            className="btn-ghost"
+            style={{ borderColor: '#38bdf8', color: '#7dd3fc' }}
+            onClick={() => setShow3DModal(true)}
+            disabled={stats.totalPoints < 2}
+            title="Open GPX to 3D Mountain &amp; STL Export Studio"
+          >
+            <Box size={16} />
+            <span>GPX to 3D</span>
+          </button>
 
           <div className="divider-v" />
 
@@ -1218,6 +1231,16 @@ export function App() {
           maxHeartRate={archiveSummary.maxHeartRate}
           maxPower={archiveSummary.maxPower}
           onClose={() => setShowShareCard(false)}
+        />
+      )}
+
+      {/* GPX to 3D Terrain & STL Studio Modal */}
+      {show3DModal && activeTrack && (
+        <GpxTo3DModal
+          trackName={activeTrack.name || doc.metadata.name || 'GPX Track'}
+          points={activeTrack.segments.flatMap((s) => s.points)}
+          terrainElevations={terrainElevations}
+          onClose={() => setShow3DModal(false)}
         />
       )}
 

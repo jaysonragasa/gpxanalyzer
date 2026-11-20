@@ -9,12 +9,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@types/three": "^0.187.0",
     "fit-file-parser": "^6.2.9",
     "jszip": "^3.10.2",
     "leaflet": "^1.9.4",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "three": "^0.187.0"
   },
   "devDependencies": {
     "@types/leaflet": "^1.9.16",
