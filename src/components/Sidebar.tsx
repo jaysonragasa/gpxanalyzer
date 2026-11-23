@@ -10,6 +10,7 @@ import {
   Gauge,
   Link2,
   MapPin,
+  Navigation,
   Plus,
   Scissors,
   Sliders,
@@ -32,6 +33,7 @@ import {
   TimestampHealth,
   toLocalDateTimeInputValue,
 } from '../utils/gpxParser';
+import { OffRoadAnomaly } from '../utils/roadAnalysis';
 
 interface SidebarProps {
   doc: GpxDocument;
@@ -40,7 +42,6 @@ interface SidebarProps {
   timestampHealth: TimestampHealth;
   selectedPointId: string | null;
   onSelectTrack: (trackId: string) => void;
-  onSelectPoint: (pointId: string) => void;
   onFocusPoint: (pointId: string, metric?: 'elevation' | 'speed') => void;
   onHoverPoint: (pointId: string | null) => void;
   onUpdatePoint: (pointId: string, patch: Partial<TrackPoint>) => void;
@@ -64,6 +65,15 @@ interface SidebarProps {
   spikeMaxCapKmh: number;
   onChangeSpikeJumpThreshold: (val: number) => void;
   onChangeSpikeMaxCap: (val: number) => void;
+  offRoadAnomalies: OffRoadAnomaly[];
+  offRoadThresholdM: number;
+  onChangeOffRoadThreshold: (val: number) => void;
+  hasRoadNetwork: boolean;
+  roadCount: number;
+  isScanningRoads: boolean;
+  onScanOsmRoads: () => void;
+  onFixOffRoadAnomaly: (anomaly: OffRoadAnomaly, mode: 'road' | 'neighbors') => void;
+  onFixAllOffRoad: (mode: 'road' | 'neighbors') => void;
   onJumpToMaxSpeed: () => void;
   onRepairTimestamps: () => void;
   onUpdateMetadata: (metaPatch: Partial<GpxDocument['metadata']>, trackPatch?: Partial<GpxTrack>) => void;
@@ -88,7 +98,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   timestampHealth,
   selectedPointId,
   onSelectTrack,
-  onSelectPoint,
   onFocusPoint,
   onHoverPoint,
   onUpdatePoint,
@@ -112,6 +121,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
   spikeMaxCapKmh,
   onChangeSpikeJumpThreshold,
   onChangeSpikeMaxCap,
+  offRoadAnomalies,
+  offRoadThresholdM,
+  onChangeOffRoadThreshold,
+  hasRoadNetwork,
+  roadCount,
+  isScanningRoads,
+  onScanOsmRoads,
+  onFixOffRoadAnomaly,
+  onFixAllOffRoad,
   onJumpToMaxSpeed,
   onRepairTimestamps,
   onUpdateMetadata,
@@ -136,6 +154,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const selectedStat = stats.pointStats.find((ps) => ps.point.id === selectedPointId);
   const selectedSpike = detectedSpikes.find((sp) => sp.pointId === selectedPointId);
+  const selectedOffRoad = selectedPointId
+    ? offRoadAnomalies.find((anom) => anom.pointIds.includes(selectedPointId))
+    : undefined;
   const prevNeighborStat =
     selectedStat && selectedStat.index > 1 ? stats.pointStats[selectedStat.index - 1] : undefined;
   const nextNeighborStat =
@@ -277,6 +298,43 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     <span>Point #{selectedStat.index + 1}</span>
                     <span>Dist: {formatDistance(selectedStat.cumulativeDistanceM)}</span>
                   </div>
+                  {selectedOffRoad && (
+                    <div
+                      className="info-box"
+                      style={{
+                        borderColor: 'rgba(236, 72, 153, 0.55)',
+                        background: 'rgba(236, 72, 153, 0.1)',
+                      }}
+                    >
+                      <div
+                        style={{
+                          color: '#f472b6',
+                          fontWeight: 600,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          gap: 6,
+                        }}
+                      >
+                        <span>
+                          Off-Road ({selectedOffRoad.maxOffRoadDistM.toFixed(0)} m off{' '}
+                          {selectedOffRoad.roadName || 'road'})
+                        </span>
+                        <button
+                          className="btn-secondary-sm"
+                          style={{
+                            padding: '2px 8px',
+                            fontSize: 11,
+                            borderColor: '#10b981',
+                            color: '#6ee7b7',
+                          }}
+                          onClick={() => onFixOffRoadAnomaly(selectedOffRoad, 'road')}
+                        >
+                          Snap to Road
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   <div className="form-grid-2">
                     <label className="field">
                       <span>Latitude</span>
@@ -605,6 +663,172 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     {activeTrack.segments.filter((s) => s.points.length > 0).length - 1})
                   </span>
                 </button>
+              )}
+            </div>
+
+            {/* Off-Road / Lost GPS Track Analyzer */}
+            <div className="panel-section">
+              <div className="points-header">
+                <span className="section-title">Off-Road / Lost Track Analyzer</span>
+                <span
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: offRoadAnomalies.length > 0 ? '#f472b6' : '#4ade80',
+                  }}
+                >
+                  {offRoadAnomalies.length} off-road
+                </span>
+              </div>
+
+              <button
+                className="btn-secondary-full"
+                style={{
+                  borderColor: hasRoadNetwork ? '#10b981' : '#38bdf8',
+                  color: hasRoadNetwork ? '#6ee7b7' : '#7dd3fc',
+                }}
+                onClick={onScanOsmRoads}
+                disabled={isScanningRoads}
+                title="Download OpenStreetMap roads along this track to verify whether every GPS point lies on an actual road or trail"
+              >
+                <Navigation size={14} />
+                <span>
+                  {isScanningRoads
+                    ? 'Scanning OpenStreetMap Roads...'
+                    : hasRoadNetwork
+                    ? `Rescan OSM Roads (${roadCount} road ways active)`
+                    : 'Scan Track Against OSM Roads'}
+                </span>
+              </button>
+
+              <label
+                className="field"
+                title="Flag points that stray at least this many meters away from the road or clean trajectory"
+              >
+                <span>
+                  Max Distance from Road (m){' '}
+                  <em style={{ color: '#94a3b8', fontWeight: 400 }}>
+                    ({hasRoadNetwork ? 'OSM Road Match' : 'Trajectory Detour Mode'})
+                  </em>
+                </span>
+                <input
+                  type="number"
+                  min="3"
+                  max="250"
+                  step="1"
+                  value={offRoadThresholdM}
+                  onChange={(e) =>
+                    onChangeOffRoadThreshold(Math.max(3, parseFloat(e.target.value) || 15))
+                  }
+                />
+              </label>
+
+              {offRoadAnomalies.length > 0 ? (
+                <>
+                  <div className="action-row">
+                    <button
+                      className="btn-primary-full"
+                      style={{ background: '#10b981' }}
+                      onClick={() => onFixAllOffRoad('road')}
+                      title="Snap all detected off-road points directly onto the matched OpenStreetMap road path"
+                    >
+                      <Navigation size={14} />
+                      <span>
+                        Snap All Off-Road to Road (
+                        {offRoadAnomalies.reduce((acc, a) => acc + a.pointIds.length, 0)} pts)
+                      </span>
+                    </button>
+                  </div>
+                  <div className="action-row">
+                    <button
+                      className="btn-secondary-full"
+                      onClick={() => onFixAllOffRoad('neighbors')}
+                      title="Straighten all off-road excursions between their nearest on-road points before and after"
+                    >
+                      <Sparkles size={13} />
+                      <span>Align All to Nearest On-Road Neighbors</span>
+                    </button>
+                  </div>
+
+                  <div className="points-table-wrap" style={{ maxHeight: 210 }}>
+                    <table className="points-table">
+                      <thead>
+                        <tr>
+                          <th>Points</th>
+                          <th>Off-Road</th>
+                          <th>Nearest Road</th>
+                          <th style={{ textAlign: 'right' }}>Fix</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {offRoadAnomalies.map((anom) => {
+                          const isSel =
+                            selectedPointId !== null && anom.pointIds.includes(selectedPointId);
+                          const rangeLabel =
+                            anom.startIndex === anom.endIndex
+                              ? `#${anom.startIndex + 1}`
+                              : `#${anom.startIndex + 1}–${anom.endIndex + 1}`;
+                          return (
+                            <tr
+                              key={anom.id}
+                              className={isSel ? 'selected' : ''}
+                              onClick={() => onFocusPoint(anom.id)}
+                              onMouseEnter={() => onHoverPoint(anom.id)}
+                              onMouseLeave={() => onHoverPoint(null)}
+                              title={`Click to zoom Map & Graph to off-road excursion (${rangeLabel}, ${formatDistance(
+                                anom.cumulativeDistanceM
+                              )})`}
+                            >
+                              <td>{rangeLabel}</td>
+                              <td style={{ color: '#f472b6', fontWeight: 700 }}>
+                                {anom.maxOffRoadDistM.toFixed(0)} m
+                              </td>
+                              <td
+                                style={{
+                                  color: '#6ee7b7',
+                                  maxWidth: 95,
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap',
+                                }}
+                                title={anom.roadName || 'Nearest On-Road Path'}
+                              >
+                                {anom.roadName || (hasRoadNetwork ? 'OSM Road' : 'Path Line')}
+                              </td>
+                              <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                <button
+                                  className="btn-secondary-sm"
+                                  style={{
+                                    padding: '2px 6px',
+                                    fontSize: 10.5,
+                                    borderColor: '#10b981',
+                                    color: '#6ee7b7',
+                                  }}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    onFixOffRoadAnomaly(anom, 'road');
+                                  }}
+                                  title="Snap these off-road points directly onto the road"
+                                >
+                                  Snap Road
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              ) : (
+                <div
+                  className="info-box"
+                  style={{ color: '#86efac', borderColor: 'rgba(34,197,94,0.3)' }}
+                >
+                  {hasRoadNetwork
+                    ? `All points are within ${offRoadThresholdM} m of an OpenStreetMap road.`
+                    : `No lateral off-track jumps ≥ ${offRoadThresholdM} m detected. Click "Scan Track Against OSM Roads" above to verify against real OpenStreetMap roads.`}
+                </div>
               )}
             </div>
 
@@ -1056,7 +1280,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                         <tr
                           key={ps.point.id}
                           className={isSelected ? 'selected' : ''}
-                          onClick={() => onSelectPoint(ps.point.id)}
+                          onClick={() => onFocusPoint(ps.point.id)}
                           onMouseEnter={() => onHoverPoint(ps.point.id)}
                           onMouseLeave={() => onHoverPoint(null)}
                         >

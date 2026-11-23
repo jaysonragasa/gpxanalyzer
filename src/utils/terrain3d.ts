@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import JSZip from 'jszip';
 import { STLExporter } from 'three/examples/jsm/exporters/STLExporter.js';
 import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { Font, type FontData } from 'three/examples/jsm/loaders/FontLoader.js';
@@ -17,6 +18,431 @@ export type ColorTheme3D =
 
 export type TrackStyle3D = 'tube' | 'ribbon';
 export type PlaquePosition3D = 'bottom' | 'top' | 'left' | 'right';
+export type ColorReductionCount = 4 | 7;
+
+export interface BambuSwatch {
+  hex: string;
+  name: string;
+}
+
+/**
+ * The 27 official Bambu Lab Filament Swatches matching the 3x9 Bambu Studio color picker grid.
+ */
+export const BAMBU_FILAMENT_PALETTE: BambuSwatch[] = [
+  // Row 1
+  { hex: '#000000', name: 'Black' },
+  { hex: '#545454', name: 'Dark Gray' },
+  { hex: '#FFFFFF', name: 'Jade White' },
+  { hex: '#C12E1F', name: 'Red' },
+  { hex: '#9D432C', name: 'Brown' },
+  { hex: '#F7E6DE', name: 'Beige' },
+  { hex: '#FF6A13', name: 'Orange' },
+  { hex: '#6F5034', name: 'Dark Brown' },
+  { hex: '#FF9016', name: 'Pumpkin Orange' },
+  // Row 2
+  { hex: '#E4BD68', name: 'Gold / Desert Tan' },
+  { hex: '#FEC600', name: 'Sunflower Yellow' },
+  { hex: '#847D48', name: 'Olive Green' },
+  { hex: '#F4EE2A', name: 'Lemon Yellow' },
+  { hex: '#BECF00', name: 'Mistletoe Green' },
+  { hex: '#8E9089', name: 'Ash Gray' },
+  { hex: '#3F8E43', name: 'Pine Green' },
+  { hex: '#00AE42', name: 'Bambu Green' },
+  { hex: '#00B1B7', name: 'Turquoise' },
+  // Row 3
+  { hex: '#A6A9AA', name: 'Silver / Light Gray' },
+  { hex: '#0086D6', name: 'Cyan' },
+  { hex: '#D1D3D5', name: 'Ice Gray' },
+  { hex: '#0056B8', name: 'Cobalt Blue' },
+  { hex: '#5B6579', name: 'Blue Gray' },
+  { hex: '#0A2989', name: 'Dark Blue' },
+  { hex: '#5E43B7', name: 'Purple' },
+  { hex: '#482960', name: 'Indigo Purple' },
+  { hex: '#EC008C', name: 'Magenta' },
+];
+
+export type BambuColorRole =
+  | 'base'
+  | 'track'
+  | 'text'
+  | 'terrainLow'
+  | 'terrainMid'
+  | 'terrainHigh'
+  | 'markers';
+
+export type BambuColorMapping = Record<BambuColorRole, string>;
+
+const NEUTRAL_BAMBU_HEXES = new Set([
+  '#000000',
+  '#545454',
+  '#FFFFFF',
+  '#8E9089',
+  '#A6A9AA',
+  '#D1D3D5',
+]);
+
+function hexToRgbTuple(hex: string): [number, number, number] {
+  const clean = hex.replace(/^#/, '').trim();
+  const num = parseInt(clean.slice(0, 6), 16);
+  if (isNaN(num)) return [148, 163, 184];
+  return [(num >> 16) & 255, (num >> 8) & 255, num & 255];
+}
+
+function rgbToHsl(r255: number, g255: number, b255: number): [number, number, number] {
+  const r = r255 / 255;
+  const g = g255 / 255;
+  const b = b255 / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h = 0;
+  if (max === r) {
+    h = (g - b) / d + (g < b ? 6 : 0);
+  } else if (max === g) {
+    h = (b - r) / d + 2;
+  } else {
+    h = (r - g) / d + 4;
+  }
+  return [(h / 6) * 360, s, l];
+}
+
+/** sRGB (0..255) -> OKLab [L, a, b]. OKLab hue stays stable across lightness. */
+function rgbToOklab(r255: number, g255: number, b255: number): [number, number, number] {
+  const lin = (v: number) => {
+    const c = v / 255;
+    return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  const r = lin(r255);
+  const g = lin(g255);
+  const b = lin(b255);
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [
+    0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+  ];
+}
+
+const oklabCache = new Map<string, [number, number, number]>();
+function hexToOklch(hex: string): [number, number, number] {
+  const key = hex.toUpperCase();
+  let lab = oklabCache.get(key);
+  if (!lab) {
+    const [r, g, b] = hexToRgbTuple(key);
+    lab = rgbToOklab(r, g, b);
+    if (oklabCache.size < 4096) oklabCache.set(key, lab);
+  }
+  const C = Math.hypot(lab[1], lab[2]);
+  return [lab[0], C, Math.atan2(lab[2], lab[1])];
+}
+
+/**
+ * How a color is compared with the filament swatches:
+ * - 'standard': theme / custom colors, compared as they are.
+ * - 'imagery': satellite / topo pixels. Imagery is much darker and duller than
+ *   filament, so its chroma is boosted and lightness counts less. Without this a
+ *   dull forest green lands on Dark Brown instead of Pine / Bambu / Olive Green.
+ */
+export type BambuMatchMode = 'standard' | 'imagery';
+
+// OKLCh chroma below which a swatch reads as gray/black/white
+const NEUTRAL_CHROMA = 0.03;
+
+/**
+ * Theme / custom colors: hue-aware weighted RGB distance (unchanged behavior)
+ */
+function standardBambuDistance(targetHex: string, swatchHex: string): number {
+  const rgbA = hexToRgbTuple(targetHex);
+  const rgbB = hexToRgbTuple(swatchHex);
+  const rMean = (rgbA[0] + rgbB[0]) * 0.5;
+  const dr = rgbA[0] - rgbB[0];
+  const dg = rgbA[1] - rgbB[1];
+  const db = rgbA[2] - rgbB[2];
+  const rgbDistSq =
+    (2 + rMean / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rMean) / 256) * db * db;
+
+  const [hA, sA, lA] = rgbToHsl(rgbA[0], rgbA[1], rgbA[2]);
+  const [hB, sB, lB] = rgbToHsl(rgbB[0], rgbB[1], rgbB[2]);
+  const isSwatchNeutral = NEUTRAL_BAMBU_HEXES.has(swatchHex.toUpperCase()) || sB < 0.08;
+  const isTargetChromatic = sA >= 0.14 && lA >= 0.1 && lA <= 0.9;
+
+  let penalty = 0;
+  if (isTargetChromatic && isSwatchNeutral) {
+    penalty += 95000 * sA;
+  } else if (!isTargetChromatic && !isSwatchNeutral && sB > 0.25) {
+    penalty += 35000 * sB;
+  }
+  if (isTargetChromatic && !isSwatchNeutral) {
+    let hDiff = Math.abs(hA - hB) % 360;
+    if (hDiff > 180) hDiff = 360 - hDiff;
+    penalty += hDiff * hDiff * 18 * Math.min(1, sA * 1.8);
+  }
+  const lDiff = Math.abs(lA - lB);
+  penalty += lDiff * lDiff * 18000;
+  return rgbDistSq + penalty;
+}
+
+/**
+ * Satellite / topo pixels: hue-first OKLCh distance. Imagery is far darker and
+ * duller than filament, so lightness and chroma gaps count little and hue
+ * decides. A dull forest green then matches Pine / Bambu / Olive Green, while
+ * real brown earth still matches a brown.
+ */
+function imageryBambuDistance(targetHex: string, swatchHex: string): number {
+  const [Lt, Ct, ht] = hexToOklch(targetHex);
+  const [Ls, Cs, hs] = hexToOklch(swatchHex);
+  const dL = Lt - Ls;
+  const dC = Ct - Cs;
+  if (Ct < 0.025) {
+    // Gray / snow / rock pixel: lightness + chroma closeness
+    return dL * dL + dC * dC * 8;
+  }
+  const hueTrust = Math.min(1, Ct / 0.04); // very dull pixels have noisy hue
+  const swatchNeutral = Cs < NEUTRAL_CHROMA || NEUTRAL_BAMBU_HEXES.has(swatchHex.toUpperCase());
+  let d = (0.55 * dL) ** 2 + (0.5 * dC) ** 2;
+  if (swatchNeutral) {
+    d += (0.22 * hueTrust) ** 2;
+  } else {
+    let dh = Math.abs(ht - hs);
+    if (dh > Math.PI) dh = 2 * Math.PI - dh;
+    d += ((dh / Math.PI) * 0.75 * hueTrust) ** 2;
+  }
+  return d;
+}
+
+function perceptualBambuDistance(
+  targetHex: string,
+  swatchHex: string,
+  mode: BambuMatchMode = 'standard'
+): number {
+  return mode === 'imagery'
+    ? imageryBambuDistance(targetHex, swatchHex)
+    : standardBambuDistance(targetHex, swatchHex);
+}
+/**
+ * Finds the closest color from the 27-color Bambu Lab filament palette using hue-aware matching.
+ */
+export function matchNearestBambuColor(
+  targetHex: string,
+  allowedPool: BambuSwatch[] = BAMBU_FILAMENT_PALETTE,
+  mode: BambuMatchMode = 'standard'
+): BambuSwatch {
+  let best = allowedPool[0] || BAMBU_FILAMENT_PALETTE[0];
+  let bestDist = Infinity;
+
+  for (const sw of allowedPool) {
+    const d = perceptualBambuDistance(targetHex, sw.hex, mode);
+    if (d < bestDist) {
+      bestDist = d;
+      best = sw;
+    }
+  }
+  return best;
+}
+
+export function getBambuSwatchByHex(hex: string): BambuSwatch {
+  const upper = hex.toUpperCase();
+  return (
+    BAMBU_FILAMENT_PALETTE.find((s) => s.hex.toUpperCase() === upper) ||
+    matchNearestBambuColor(hex)
+  );
+}
+
+type WeightedPixel = { hex: string; w: number };
+
+/**
+ * Samples the satellite / topo texture across the DEM grid and sorts the pixels
+ * into Low (valley/water), Mid (forest/slopes) and High (ridge/summit) elevation bands.
+ */
+function sampleTextureElevationPixels(
+  textureCanvas: HTMLCanvasElement,
+  demGrid: DemGridData | null
+): { low: WeightedPixel[]; mid: WeightedPixel[]; high: WeightedPixel[] } | null {
+  const ctx = textureCanvas.getContext('2d');
+  if (!ctx) return null;
+  const w = textureCanvas.width;
+  const h = textureCanvas.height;
+  const imgData = ctx.getImageData(0, 0, w, h).data;
+
+  let minE = Infinity;
+  let maxE = -Infinity;
+  if (demGrid) {
+    for (const row of demGrid.elevations) {
+      for (const e of row) {
+        if (e < minE) minE = e;
+        if (e > maxE) maxE = e;
+      }
+    }
+  }
+  const spanE = Math.max(10, maxE - minE);
+  const bands: WeightedPixel[][] = [[], [], []];
+
+  const steps = 48;
+  for (let ry = 0; ry < steps; ry += 1) {
+    const v = (ry + 0.5) / steps; // 0 = South, 1 = North
+    const py = Math.min(h - 1, Math.max(0, Math.floor((1 - v) * h)));
+    for (let cx = 0; cx < steps; cx += 1) {
+      const u = (cx + 0.5) / steps; // 0 = West, 1 = East
+      const px = Math.min(w - 1, Math.max(0, Math.floor(u * w)));
+      const idx = (py * w + px) * 4;
+      const r = imgData[idx];
+      const g = imgData[idx + 1];
+      const b = imgData[idx + 2];
+
+      let normH: number;
+      if (demGrid) {
+        const lat = demGrid.minLat + v * (demGrid.maxLat - demGrid.minLat);
+        const lon = demGrid.minLon + u * (demGrid.maxLon - demGrid.minLon);
+        normH = Math.max(0, Math.min(1, (sampleBilinearDem(demGrid, lat, lon) - minE) / spanE));
+      } else {
+        normH = rgbToHsl(r, g, b)[2]; // no DEM: bucket by lightness
+      }
+      const band = normH >= 0.62 ? 2 : normH >= 0.25 ? 1 : 0;
+      const [, sat] = rgbToHsl(r, g, b);
+      // Chromatic pixels count more so clouds/shadows don't outvote vegetation or water
+      bands[band].push({
+        hex: `#${((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1).toUpperCase()}`,
+        w: 1 + sat * 2.5,
+      });
+    }
+  }
+  return { low: bands[0], mid: bands[1], high: bands[2] };
+}
+
+/**
+ * Dominant filament for a set of pixels: every pixel votes for its nearest swatch
+ * in the pool and the swatch with the most weight wins. Unlike averaging the
+ * pixels first, a forest with some brown rock stays green.
+ */
+function dominantSwatch(pixels: WeightedPixel[], pool: BambuSwatch[]): BambuSwatch | null {
+  if (pixels.length === 0 || pool.length === 0) return null;
+  const votes = new Map<string, number>();
+  for (const px of pixels) {
+    const sw = matchNearestBambuColor(px.hex, pool, 'imagery');
+    votes.set(sw.hex, (votes.get(sw.hex) || 0) + px.w);
+  }
+  let best: BambuSwatch | null = null;
+  let bestW = -1;
+  for (const sw of pool) {
+    const wv = votes.get(sw.hex) || 0;
+    if (wv > bestW) {
+      bestW = wv;
+      best = sw;
+    }
+  }
+  return best;
+}
+/**
+ * Computes an automatic 4-color (1x AMS) or 7-color (2x AMS) reduced & palette-matched
+ * Bambu filament assignment from the current 3D theme colors AND active satellite/topo texture.
+ */
+export function computeAutoBambuColorMapping(
+  opts: Pick<
+    Terrain3DOptions,
+    'theme' | 'customLowColor' | 'customHighColor' | 'customTrackColor' | 'customBaseColor'
+  >,
+  colorCount: ColorReductionCount,
+  textureCanvas?: HTMLCanvasElement | null,
+  demGrid?: DemGridData | null
+): BambuColorMapping {
+  const pal = getThemePalette(opts as Terrain3DOptions);
+  const rawBase = `#${pal.base.getHexString().toUpperCase()}`;
+  const rawTrack = `#${pal.track.getHexString().toUpperCase()}`;
+
+  const rawLow = `#${pal.low.getHexString().toUpperCase()}`;
+  const rawMid = `#${pal.mid.getHexString().toUpperCase()}`;
+  const rawHigh = `#${pal.high.getHexString().toUpperCase()}`;
+
+  // Map themes: terrain colors come from the actual imagery, by pixel vote
+  const sampled =
+    textureCanvas && (opts.theme === 'satellite' || opts.theme === 'topo')
+      ? sampleTextureElevationPixels(textureCanvas, demGrid || null)
+      : null;
+  const pickTerrain = (
+    pixels: WeightedPixel[] | null,
+    rawHex: string,
+    pool: BambuSwatch[]
+  ): BambuSwatch =>
+    (pixels && dominantSwatch(pixels, pool)) || matchNearestBambuColor(rawHex, pool);
+
+  const matchedBase = matchNearestBambuColor(rawBase).hex;
+  const matchedTrack = matchNearestBambuColor(rawTrack).hex;
+
+  // Pick a high-contrast text color (White or Sunflower Yellow if base is light)
+  const baseRgb = hexToRgbTuple(matchedBase);
+  const baseLuma = 0.299 * baseRgb[0] + 0.587 * baseRgb[1] + 0.114 * baseRgb[2];
+  const matchedText =
+    baseLuma > 170
+      ? '#000000'
+      : matchedTrack === '#FFFFFF'
+      ? '#FEC600'
+      : '#FFFFFF';
+
+  if (colorCount === 4) {
+    // 4-Color AMS Reduction:
+    // Slot 1: Base & Plaque Pedestal
+    // Slot 2: Dominant Terrain Relief (Pine Green / Bambu Green / Olive Green for forests/mountains)
+    // Slot 3: GPS Track & Markers
+    // Slot 4: Embossed Plaque Text & High Peaks
+    const terrainPool = BAMBU_FILAMENT_PALETTE.filter(
+      (s) =>
+        s.hex !== matchedBase &&
+        s.hex !== matchedTrack &&
+        (opts.theme === 'pla' || !NEUTRAL_BAMBU_HEXES.has(s.hex))
+    );
+    // One terrain filament: the dominant color of valleys + slopes
+    let matchedTerrain: string;
+    if (sampled) {
+      matchedTerrain = pickTerrain([...sampled.low, ...sampled.mid], rawMid, terrainPool).hex;
+    } else {
+      const lowRgb = hexToRgbTuple(rawLow);
+      const midRgb = hexToRgbTuple(rawMid);
+      const [, satLow] = rgbToHsl(lowRgb[0], lowRgb[1], lowRgb[2]);
+      const [, satMid] = rgbToHsl(midRgb[0], midRgb[1], midRgb[2]);
+      matchedTerrain = matchNearestBambuColor(satLow >= satMid ? rawLow : rawMid, terrainPool).hex;
+    }
+
+    return {
+      base: matchedBase,
+      track: matchedTrack,
+      text: matchedText,
+      terrainLow: matchedTerrain,
+      terrainMid: matchedTerrain,
+      terrainHigh: matchedText,
+      markers: matchedTrack,
+    };
+  }
+
+  // 7-Color Multi-AMS Reduction:
+  const chromaticTerrainPool =
+    opts.theme === 'pla'
+      ? BAMBU_FILAMENT_PALETTE
+      : BAMBU_FILAMENT_PALETTE.filter((s) => !NEUTRAL_BAMBU_HEXES.has(s.hex));
+  const matchedLow = pickTerrain(sampled?.low ?? null, rawLow, chromaticTerrainPool).hex;
+  const midPool = chromaticTerrainPool.filter((s) => s.hex !== matchedLow);
+  const matchedMid = pickTerrain(sampled?.mid ?? null, rawMid, midPool).hex;
+  const highPool = BAMBU_FILAMENT_PALETTE.filter(
+    (s) => s.hex !== matchedLow && s.hex !== matchedMid
+  );
+  const matchedHigh = pickTerrain(sampled?.high ?? null, rawHigh, highPool).hex;
+  const markerSw =
+    matchedTrack === '#00AE42' ? '#FEC600' : '#00AE42';
+
+  return {
+    base: matchedBase,
+    track: matchedTrack,
+    text: matchedText,
+    terrainLow: matchedLow,
+    terrainMid: matchedMid,
+    terrainHigh: matchedHigh,
+    markers: markerSw,
+  };
+}
 
 export interface Terrain3DOptions {
   baseShape: BaseShape3D;
@@ -50,6 +476,9 @@ export interface Terrain3DOptions {
   customHighColor: string;
   customTrackColor: string;
   customBaseColor: string;
+  bambuPreviewEnabled?: boolean;
+  bambuColorCount?: ColorReductionCount;
+  bambuColorMapping?: BambuColorMapping;
 }
 
 export interface DemGridData {
@@ -678,8 +1107,9 @@ export function buildTerrainSceneObjects(
   const eleSpan = Math.max(10, maxEle - minEle);
   const maxReliefMm = 26 * opts.zExaggeration;
   const baseZ = opts.baseThicknessMm;
+  const minReliefFloorMm = 0.4;
   const eleToZ = (ele: number) =>
-    baseZ + Math.max(0, ((ele - minEle) / eleSpan) * maxReliefMm);
+    baseZ + minReliefFloorMm + Math.max(0, ((ele - minEle) / eleSpan) * maxReliefMm);
 
   const hasPlaque =
     opts.baseShape !== 'ribbon' &&
@@ -828,7 +1258,63 @@ export function buildTerrainSceneObjects(
     }
 
     // Build terrain surface vertices & quads
+    const activeBambuMap =
+      opts.bambuColorMapping ||
+      computeAutoBambuColorMapping(opts, opts.bambuColorCount || 4, textureCanvas, demGrid);
+
+    const hasMapTexture =
+      Boolean(textureCanvas) && (opts.theme === 'satellite' || opts.theme === 'topo');
+    const texCtx = hasMapTexture ? textureCanvas!.getContext('2d') : null;
+    const texW = hasMapTexture ? textureCanvas!.width : 0;
+    const texH = hasMapTexture ? textureCanvas!.height : 0;
+    const texPixels = texCtx ? texCtx.getImageData(0, 0, texW, texH).data : null;
+
+    // Candidate Bambu terrain swatches selected by the user's 4-color or 7-color slots
+    const candidateTerrainHexes = Array.from(
+      new Set(
+        opts.bambuColorCount === 4
+          ? [activeBambuMap.terrainLow, activeBambuMap.terrainMid]
+          : [
+              activeBambuMap.terrainLow,
+              activeBambuMap.terrainMid,
+              activeBambuMap.terrainHigh,
+            ]
+      )
+    );
+    const candidateTerrainSwatches: BambuSwatch[] = candidateTerrainHexes.map((hx) => ({
+      hex: hx,
+      name: hx,
+    }));
+
+    const evalBambuTerrainHexAt = (uTex: number, vTex: number, ele: number): string => {
+      const t = Math.max(0, Math.min(1, (ele - minEle) / eleSpan));
+      // If we have satellite/topo imagery and multiple terrain slots (e.g. 7-color mode),
+      // match each vertex's local satellite pixel directly to the closest selected terrain filament
+      // while blending in elevation height so peaks and valleys stay coherent.
+      if (texPixels && candidateTerrainSwatches.length > 1) {
+        const px = Math.min(texW - 1, Math.max(0, Math.floor(uTex * texW)));
+        const py = Math.min(texH - 1, Math.max(0, Math.floor((1 - vTex) * texH)));
+        const pIdx = (py * texW + px) * 4;
+        const r = texPixels[pIdx];
+        const g = texPixels[pIdx + 1];
+        const b = texPixels[pIdx + 2];
+        const pixHex = `#${((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1).toUpperCase()}`;
+        return matchNearestBambuColor(pixHex, candidateTerrainSwatches, 'imagery').hex;
+      }
+      if (opts.bambuColorCount === 4) {
+        return t >= 0.78 ? activeBambuMap.terrainHigh : activeBambuMap.terrainLow;
+      }
+      return t >= 0.62
+        ? activeBambuMap.terrainHigh
+        : t >= 0.25
+        ? activeBambuMap.terrainMid
+        : activeBambuMap.terrainLow;
+    };
+
+    const gridBambuHex: string[][] = [];
+
     for (let r = 0; r <= N; r += 1) {
+      const rowBambuHex: string[] = [];
       for (let c = 0; c <= N; c += 1) {
         const [x, y, z] = gridXYZ[r][c];
         const ele = gridEle[r][c];
@@ -837,14 +1323,23 @@ export function buildTerrainSceneObjects(
         terrainPositions.push(x, y, z);
         terrainUvs.push(uTex, vTex);
 
-        // Calculate elevation gradient color for non-texture themes
+        // Calculate elevation gradient color for non-texture themes or Bambu quantized preview
         const t = Math.max(0, Math.min(1, (ele - minEle) / eleSpan));
-        const color =
-          t < 0.5
-            ? palette.low.clone().lerp(palette.mid, t * 2)
-            : palette.mid.clone().lerp(palette.high, (t - 0.5) * 2);
+        const bambuHex = evalBambuTerrainHexAt(uTex, vTex, ele);
+        rowBambuHex.push(bambuHex);
+
+        let color: THREE.Color;
+        if (opts.bambuPreviewEnabled) {
+          color = new THREE.Color(bambuHex);
+        } else {
+          color =
+            t < 0.5
+              ? palette.low.clone().lerp(palette.mid, t * 2)
+              : palette.mid.clone().lerp(palette.high, (t - 0.5) * 2);
+        }
         terrainColors.push(color.r, color.g, color.b);
       }
+      gridBambuHex.push(rowBambuHex);
     }
 
     for (let r = 0; r < N; r += 1) {
@@ -859,6 +1354,124 @@ export function buildTerrainSceneObjects(
       }
     }
 
+    // Close the terrain relief volume down to z = baseZ so it is a 100% watertight
+    // manifold solid for multi-color 3MF printing (separate from the base pedestal)
+    const addTerrainSkirtEdge = (
+      pA: [number, number, number],
+      pB: [number, number, number],
+      uvA: [number, number],
+      uvB: [number, number],
+      eleA: number,
+      eleB: number
+    ) => {
+      const bA: [number, number, number] = [pA[0], pA[1], baseZ];
+      const bB: [number, number, number] = [pB[0], pB[1], baseZ];
+
+      const tA = Math.max(0, Math.min(1, (eleA - minEle) / eleSpan));
+      const colA = opts.bambuPreviewEnabled
+        ? new THREE.Color(evalBambuTerrainHexAt(uvA[0], uvA[1], eleA))
+        : tA < 0.5
+        ? palette.low.clone().lerp(palette.mid, tA * 2)
+        : palette.mid.clone().lerp(palette.high, (tA - 0.5) * 2);
+
+      const tB = Math.max(0, Math.min(1, (eleB - minEle) / eleSpan));
+      const colB = opts.bambuPreviewEnabled
+        ? new THREE.Color(evalBambuTerrainHexAt(uvB[0], uvB[1], eleB))
+        : tB < 0.5
+        ? palette.low.clone().lerp(palette.mid, tB * 2)
+        : palette.mid.clone().lerp(palette.high, (tB - 0.5) * 2);
+
+      const baseIdx = terrainPositions.length / 3;
+      terrainPositions.push(...bA, ...bB, ...pB, ...pA);
+      terrainUvs.push(...uvA, ...uvB, ...uvB, ...uvA);
+      terrainColors.push(
+        colA.r,
+        colA.g,
+        colA.b,
+        colB.r,
+        colB.g,
+        colB.b,
+        colB.r,
+        colB.g,
+        colB.b,
+        colA.r,
+        colA.g,
+        colA.b
+      );
+      terrainIndices.push(baseIdx, baseIdx + 1, baseIdx + 2, baseIdx, baseIdx + 2, baseIdx + 3);
+    };
+
+    // South skirt (v = 0)
+    for (let c = 0; c < N; c += 1) {
+      addTerrainSkirtEdge(
+        gridXYZ[0][c],
+        gridXYZ[0][c + 1],
+        gridUV[0][c],
+        gridUV[0][c + 1],
+        gridEle[0][c],
+        gridEle[0][c + 1]
+      );
+    }
+    // East skirt (u = N)
+    for (let r = 0; r < N; r += 1) {
+      addTerrainSkirtEdge(
+        gridXYZ[r][N],
+        gridXYZ[r + 1][N],
+        gridUV[r][N],
+        gridUV[r + 1][N],
+        gridEle[r][N],
+        gridEle[r + 1][N]
+      );
+    }
+    // North skirt (v = N, East to West)
+    for (let c = N; c > 0; c -= 1) {
+      addTerrainSkirtEdge(
+        gridXYZ[N][c],
+        gridXYZ[N][c - 1],
+        gridUV[N][c],
+        gridUV[N][c - 1],
+        gridEle[N][c],
+        gridEle[N][c - 1]
+      );
+    }
+    // West skirt (u = 0, North to South)
+    for (let r = N; r > 0; r -= 1) {
+      addTerrainSkirtEdge(
+        gridXYZ[r][0],
+        gridXYZ[r - 1][0],
+        gridUV[r][0],
+        gridUV[r - 1][0],
+        gridEle[r][0],
+        gridEle[r - 1][0]
+      );
+    }
+
+    // Terrain bottom floor at z = baseZ (facing -Z)
+    const botFloorColor =
+      opts.bambuPreviewEnabled && opts.bambuColorMapping
+        ? new THREE.Color(opts.bambuColorMapping.terrainLow)
+        : palette.low;
+    const terrainBotBaseIdx = terrainPositions.length / 3;
+    for (let r = 0; r <= N; r += 1) {
+      for (let c = 0; c <= N; c += 1) {
+        const [x, y] = gridXYZ[r][c];
+        const [uTex, vTex] = gridUV[r][c];
+        terrainPositions.push(x, y, baseZ);
+        terrainUvs.push(uTex, vTex);
+        terrainColors.push(botFloorColor.r, botFloorColor.g, botFloorColor.b);
+      }
+    }
+    for (let r = 0; r < N; r += 1) {
+      for (let c = 0; c < N; c += 1) {
+        const i00 = terrainBotBaseIdx + r * (N + 1) + c;
+        const i10 = terrainBotBaseIdx + r * (N + 1) + (c + 1);
+        const i11 = terrainBotBaseIdx + (r + 1) * (N + 1) + (c + 1);
+        const i01 = terrainBotBaseIdx + (r + 1) * (N + 1) + c;
+        terrainIndices.push(i00, i11, i10);
+        terrainIndices.push(i00, i01, i11);
+      }
+    }
+
     const terrainGeom = new THREE.BufferGeometry();
     terrainGeom.setAttribute(
       'position',
@@ -870,7 +1483,11 @@ export function buildTerrainSceneObjects(
     terrainGeom.computeVertexNormals();
 
     let terrainMat: THREE.Material;
-    if (textureCanvas && (opts.theme === 'satellite' || opts.theme === 'topo')) {
+    if (
+      !opts.bambuPreviewEnabled &&
+      textureCanvas &&
+      (opts.theme === 'satellite' || opts.theme === 'topo')
+    ) {
       const tex = new THREE.CanvasTexture(textureCanvas);
       tex.colorSpace = THREE.SRGBColorSpace;
       tex.wrapS = THREE.ClampToEdgeWrapping;
@@ -894,28 +1511,42 @@ export function buildTerrainSceneObjects(
 
     const terrainMesh = new THREE.Mesh(terrainGeom, terrainMat);
     terrainMesh.name = 'terrainMesh';
+    terrainMesh.userData.exportColor = activeBambuMap.terrainLow;
+    terrainMesh.userData.exportPalette = {
+      low: activeBambuMap.terrainLow,
+      mid: activeBambuMap.terrainMid,
+      high: activeBambuMap.terrainHigh,
+      baseZ,
+      maxReliefMm: Math.max(0.1, maxReliefMm),
+      gridBambuHex,
+      halfW,
+      halfH,
+      gridN: N,
+    };
     terrainMesh.castShadow = true;
     terrainMesh.receiveShadow = true;
     displayGroup.add(terrainMesh);
     exportGroup.add(terrainMesh.clone());
     totalTriangles += terrainIndices.length / 3;
 
-    // 2. BASE PEDESTAL WALLS & FLAT BOTTOM AT z=0
+    // 2. BASE PEDESTAL (CLOSED MANIFOLD SOLID FROM z=0 TO z=baseZ)
     const addWallEdge = (
       pA: [number, number, number],
       pB: [number, number, number]
     ) => {
       const bA = [pA[0], pA[1], 0];
       const bB = [pB[0], pB[1], 0];
+      const tA = [pA[0], pA[1], baseZ];
+      const tB = [pB[0], pB[1], baseZ];
 
-      const vA = new THREE.Vector3(...pA);
-      const vB = new THREE.Vector3(...pB);
+      const vA = new THREE.Vector3(...tA);
+      const vB = new THREE.Vector3(...tB);
       const edge = new THREE.Vector3().subVectors(vB, vA);
       const down = new THREE.Vector3(0, 0, -1);
       const wallNorm = new THREE.Vector3().crossVectors(down, edge).normalize();
 
       const baseIdx = basePositions.length / 3;
-      basePositions.push(...bA, ...bB, ...pB, ...pA);
+      basePositions.push(...bA, ...bB, ...tB, ...tA);
       baseNormals.push(
         wallNorm.x,
         wallNorm.y,
@@ -942,7 +1573,7 @@ export function buildTerrainSceneObjects(
     // West wall (u = 0, North to South)
     for (let r = N; r > 0; r -= 1) addWallEdge(gridXYZ[r][0], gridXYZ[r - 1][0]);
 
-    // Flat bottom plate at z=0 (normal is 0, 0, -1)
+    // Flat bottom plate at z=0 (normal is 0, 0, -1) & top cap at z=baseZ (normal is 0, 0, +1)
     for (let r = 0; r < N; r += 1) {
       for (let c = 0; c < N; c += 1) {
         const b00 = [gridXYZ[r][c][0], gridXYZ[r][c][1], 0];
@@ -954,6 +1585,16 @@ export function buildTerrainSceneObjects(
         basePositions.push(...b00, ...b10, ...b11, ...b01);
         baseNormals.push(0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1);
         baseIndices.push(baseIdx, baseIdx + 2, baseIdx + 1, baseIdx, baseIdx + 3, baseIdx + 2);
+
+        const t00 = [gridXYZ[r][c][0], gridXYZ[r][c][1], baseZ];
+        const t10 = [gridXYZ[r][c + 1][0], gridXYZ[r][c + 1][1], baseZ];
+        const t11 = [gridXYZ[r + 1][c + 1][0], gridXYZ[r + 1][c + 1][1], baseZ];
+        const t01 = [gridXYZ[r + 1][c][0], gridXYZ[r + 1][c][1], baseZ];
+
+        const topIdx = basePositions.length / 3;
+        basePositions.push(...t00, ...t10, ...t11, ...t01);
+        baseNormals.push(0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1);
+        baseIndices.push(topIdx, topIdx + 1, topIdx + 2, topIdx, topIdx + 2, topIdx + 3);
       }
     }
 
@@ -962,14 +1603,20 @@ export function buildTerrainSceneObjects(
     baseGeom.setAttribute('normal', new THREE.Float32BufferAttribute(baseNormals, 3));
     baseGeom.setIndex(baseIndices);
 
+    const baseColorThree =
+      opts.bambuPreviewEnabled && opts.bambuColorMapping
+        ? new THREE.Color(opts.bambuColorMapping.base)
+        : palette.base;
+
     const baseMat = new THREE.MeshStandardMaterial({
-      color: palette.base,
+      color: baseColorThree,
       roughness: 0.65,
       metalness: 0.15,
     });
 
     const baseMesh = new THREE.Mesh(baseGeom, baseMat);
     baseMesh.name = 'baseMesh';
+    baseMesh.userData.exportColor = activeBambuMap.base;
     baseMesh.receiveShadow = true;
     displayGroup.add(baseMesh);
     exportGroup.add(baseMesh.clone());
@@ -1043,6 +1690,7 @@ export function buildTerrainSceneObjects(
 
       const plaqueMesh = new THREE.Mesh(plaqueGeom, baseMat);
       plaqueMesh.name = 'plaqueMesh';
+      plaqueMesh.userData.exportColor = activeBambuMap.base;
       plaqueMesh.receiveShadow = true;
       displayGroup.add(plaqueMesh);
       exportGroup.add(plaqueMesh.clone());
@@ -1419,17 +2067,26 @@ export function buildTerrainSceneObjects(
         trackGeom.setIndex(tubeIndices);
         trackGeom.computeVertexNormals();
       }
+      const activeBambuForTrack =
+        opts.bambuColorMapping ||
+        computeAutoBambuColorMapping(opts, opts.bambuColorCount || 4);
+      const trackColorThree =
+        opts.bambuPreviewEnabled && opts.bambuColorMapping
+          ? new THREE.Color(opts.bambuColorMapping.track)
+          : palette.track;
+
       const trackMat = new THREE.MeshStandardMaterial({
-        color: palette.track,
+        color: trackColorThree,
         roughness: 0.32,
         metalness: 0.22,
-        emissive: palette.track,
+        emissive: trackColorThree,
         emissiveIntensity: 0.18,
         side: THREE.DoubleSide,
       });
 
       const trackMesh = new THREE.Mesh(trackGeom, trackMat);
       trackMesh.name = 'trackMesh';
+      trackMesh.userData.exportColor = activeBambuForTrack.track;
       trackMesh.castShadow = true;
       displayGroup.add(trackMesh);
       exportGroup.add(trackMesh.clone());
@@ -1487,14 +2144,38 @@ export function buildTerrainSceneObjects(
             emissiveIntensity: 0.2,
           });
           const mesh = new THREE.Mesh(geom, mat);
+          mesh.name = idx === 0 ? 'startMarkerMesh' : 'finishMarkerMesh';
+          mesh.userData.exportColor = color;
           mesh.castShadow = true;
           displayGroup.add(mesh);
           exportGroup.add(mesh.clone());
           totalTriangles += geom.index ? geom.index.count / 3 : geom.getAttribute('position').count / 3;
         };
 
-        buildMarker(0, '#22c55e', '#15803d');
-        buildMarker(numSegments, '#ef4444', '#b91c1c');
+        const startMarkerHex =
+          opts.bambuPreviewEnabled && opts.bambuColorMapping
+            ? opts.bambuColorMapping.markers
+            : activeBambuForTrack.markers;
+        const finishMarkerHex =
+          opts.bambuPreviewEnabled && opts.bambuColorMapping
+            ? (opts.bambuColorCount === 4 ? opts.bambuColorMapping.track : '#C12E1F')
+            : (opts.bambuColorCount === 4 ? activeBambuForTrack.track : '#C12E1F');
+
+        buildMarker(
+          0,
+          opts.bambuPreviewEnabled ? startMarkerHex : '#22c55e',
+          opts.bambuPreviewEnabled ? startMarkerHex : '#15803d'
+        );
+        buildMarker(
+          numSegments,
+          opts.bambuPreviewEnabled ? finishMarkerHex : '#ef4444',
+          opts.bambuPreviewEnabled ? finishMarkerHex : '#b91c1c'
+        );
+        // Ensure exported 3MF uses the quantized Bambu filament colors
+        exportGroup.traverse((c) => {
+          if (c.name === 'startMarkerMesh') c.userData.exportColor = startMarkerHex;
+          if (c.name === 'finishMarkerMesh') c.userData.exportColor = finishMarkerHex;
+        });
       }
     }
   }
@@ -1570,16 +2251,25 @@ export function buildTerrainSceneObjects(
         // Side plaques: text runs along the edge, letters' tops facing the map
         textGeom.rotateZ(plaqueRotation);
       }
+      const activeBambuForText =
+        opts.bambuColorMapping ||
+        computeAutoBambuColorMapping(opts, opts.bambuColorCount || 4);
+      const textDisplayColor =
+        opts.bambuPreviewEnabled && opts.bambuColorMapping
+          ? new THREE.Color(opts.bambuColorMapping.text)
+          : palette.track;
+
       const textMat = new THREE.MeshStandardMaterial({
-        color: palette.track,
+        color: textDisplayColor,
         roughness: 0.3,
         metalness: 0.25,
-        emissive: palette.track,
+        emissive: textDisplayColor,
         emissiveIntensity: 0.15,
       });
 
       const textMesh = new THREE.Mesh(textGeom, textMat);
       textMesh.name = 'textMesh';
+      textMesh.userData.exportColor = activeBambuForText.text;
       textMesh.castShadow = true;
       displayGroup.add(textMesh);
       exportGroup.add(textMesh.clone());
@@ -1658,13 +2348,23 @@ export function buildTerrainSceneObjects(
     });
     ringGeom.translate(ringX, ringY, 0);
 
+    const activeBambuForRing =
+      opts.bambuColorMapping ||
+      computeAutoBambuColorMapping(opts, opts.bambuColorCount || 4);
+    const ringHex =
+      opts.baseShape === 'ribbon' ? activeBambuForRing.track : activeBambuForRing.base;
     const ringMat = new THREE.MeshStandardMaterial({
-      color: opts.baseShape === 'ribbon' ? palette.track : palette.base,
+      color: opts.bambuPreviewEnabled
+        ? new THREE.Color(ringHex)
+        : opts.baseShape === 'ribbon'
+        ? palette.track
+        : palette.base,
       roughness: 0.65,
       metalness: 0.15,
     });
     const ringMesh = new THREE.Mesh(ringGeom, ringMat);
     ringMesh.name = 'keychainRing';
+    ringMesh.userData.exportColor = ringHex;
     ringMesh.castShadow = true;
     ringMesh.receiveShadow = true;
     displayGroup.add(ringMesh);
@@ -1726,4 +2426,316 @@ export function exportSceneToBinaryStl(
       ? stlData.buffer
       : new TextEncoder().encode(stlData as string).buffer;
   return new Blob([buffer], { type: 'application/octet-stream' });
+}
+
+function escapeXmlAttr(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function getMeshHexColor(mesh: THREE.Mesh): string {
+  if (typeof mesh.userData?.exportColor === 'string') {
+    return mesh.userData.exportColor;
+  }
+  const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  if (mat && 'color' in mat && (mat as THREE.MeshStandardMaterial).color instanceof THREE.Color) {
+    return `#${(mat as THREE.MeshStandardMaterial).color.getHexString().toUpperCase()}`;
+  }
+  return '#94A3B8';
+}
+
+function toRgba3mfHex(hex: string): string {
+  const clean = hex.replace(/^#/, '').trim().toUpperCase();
+  if (clean.length === 8) return `#${clean}`;
+  if (clean.length === 6) return `#${clean}FF`;
+  return '#94A3B8FF';
+}
+
+function getPartMetaForMesh(meshName: string): { label: string } {
+  switch (meshName) {
+    case 'baseMesh':
+      return { label: 'Base Pedestal' };
+    case 'plaqueMesh':
+      return { label: 'Title Plaque Base' };
+    case 'keychainRing':
+      return { label: 'Keychain Ring' };
+    case 'terrainMesh':
+      return { label: 'Terrain Relief' };
+    case 'trackMesh':
+      return { label: 'GPS Track Path' };
+    case 'textMesh':
+      return { label: 'Plaque Embossed Text' };
+    case 'startMarkerMesh':
+      return { label: 'Start Marker Pin' };
+    case 'finishMarkerMesh':
+      return { label: 'Finish Marker Pin' };
+    default:
+      return { label: meshName || 'Model Part' };
+  }
+}
+
+/**
+ * Extracts welded (deduplicated) vertices and non-degenerate triangle indices from a Three.js Mesh
+ * in world coordinates so Bambu Studio / OrcaSlicer / PrusaSlicer recognize the part as watertight.
+ */
+function extractWeldedMeshData(mesh: THREE.Mesh): {
+  vertices: Array<[number, number, number]>;
+  triangles: Array<[number, number, number]>;
+} {
+  mesh.updateMatrixWorld(true);
+  const geom = mesh.geometry;
+  const posAttr = geom.getAttribute('position');
+  if (!posAttr) return { vertices: [], triangles: [] };
+
+  const matrix = mesh.matrixWorld;
+  const vTemp = new THREE.Vector3();
+
+  const vertices: Array<[number, number, number]> = [];
+  const vertexMap = new Map<string, number>();
+
+  const getWeldedIndex = (rawIdx: number): number => {
+    vTemp.fromBufferAttribute(posAttr, rawIdx).applyMatrix4(matrix);
+    const qx = Math.round(vTemp.x * 10000) / 10000;
+    const qy = Math.round(vTemp.y * 10000) / 10000;
+    const qz = Math.round(vTemp.z * 10000) / 10000;
+    const key = `${qx},${qy},${qz}`;
+    const existing = vertexMap.get(key);
+    if (existing !== undefined) return existing;
+    const nextIdx = vertices.length;
+    vertices.push([qx, qy, qz]);
+    vertexMap.set(key, nextIdx);
+    return nextIdx;
+  };
+
+  const triangles: Array<[number, number, number]> = [];
+  const indexAttr = geom.getIndex();
+
+  if (indexAttr) {
+    const count = indexAttr.count;
+    for (let i = 0; i + 2 < count; i += 3) {
+      const i0 = getWeldedIndex(indexAttr.getX(i));
+      const i1 = getWeldedIndex(indexAttr.getX(i + 1));
+      const i2 = getWeldedIndex(indexAttr.getX(i + 2));
+      if (i0 !== i1 && i1 !== i2 && i0 !== i2) {
+        triangles.push([i0, i1, i2]);
+      }
+    }
+  } else {
+    const count = posAttr.count;
+    for (let i = 0; i + 2 < count; i += 3) {
+      const i0 = getWeldedIndex(i);
+      const i1 = getWeldedIndex(i + 1);
+      const i2 = getWeldedIndex(i + 2);
+      if (i0 !== i1 && i1 !== i2 && i0 !== i2) {
+        triangles.push([i0, i1, i2]);
+      }
+    }
+  }
+
+  return { vertices, triangles };
+}
+
+/**
+ * Exports the 3D scene as a multi-color, multi-part `.3mf` archive compatible with
+ * Bambu Lab Studio, OrcaSlicer, and PrusaSlicer.
+ *
+ * Uses the 3MF Material Extension (`<m:colorgroup id="1">` with `<m:color color="#RRGGBBFF" />`
+ * and `pid="1" p1="idx" p2="idx" p3="idx"` on every triangle plus `pid="1" pindex="idx"` on every
+ * object) which Bambu Studio's standard 3MF importer (`bbs_3mf.cpp`) natively parses to create
+ * and assign multi-color filament slots automatically on import.
+ */
+export async function exportSceneTo3mf(
+  exportGroup: THREE.Group,
+  modelName = 'GPX_3D_Terrain'
+): Promise<Blob> {
+  exportGroup.updateMatrixWorld(true);
+
+  interface PartEntry {
+    objectId: number;
+    name: string;
+    defaultColorIdx: number;
+    vertices: Array<[number, number, number]>;
+    triangles: Array<[number, number, number, number]>; // v1, v2, v3, colorIdx
+  }
+
+  const parts: PartEntry[] = [];
+  const colorsRgba: string[] = [];
+  let nextObjId = 2; // id=1 is reserved for <m:colorgroup id="1">
+
+  const registerColor = (hex: string): number => {
+    const rgba = toRgba3mfHex(hex);
+    const existing = colorsRgba.indexOf(rgba);
+    if (existing !== -1) return existing;
+    const idx = colorsRgba.length;
+    colorsRgba.push(rgba);
+    return idx;
+  };
+
+  exportGroup.traverse((child) => {
+    if (!(child instanceof THREE.Mesh)) return;
+    const { vertices, triangles } = extractWeldedMeshData(child);
+    if (vertices.length < 3 || triangles.length === 0) return;
+
+    const meta = getPartMetaForMesh(child.name);
+    const baseHex = getMeshHexColor(child);
+    const defaultColorIdx = registerColor(baseHex);
+
+    const coloredTriangles: Array<[number, number, number, number]> = [];
+    const expPal = child.userData?.exportPalette as
+      | {
+          low: string;
+          mid: string;
+          high: string;
+          baseZ: number;
+          maxReliefMm: number;
+          gridBambuHex?: string[][];
+          halfW?: number;
+          halfH?: number;
+          gridN?: number;
+        }
+      | undefined;
+
+    if (child.name === 'terrainMesh' && expPal) {
+      const lowIdx = registerColor(expPal.low);
+      const midIdx = registerColor(expPal.mid);
+      const highIdx = registerColor(expPal.high);
+      const bZ = expPal.baseZ;
+      const reliefSpan = Math.max(0.1, expPal.maxReliefMm);
+      const gHex = expPal.gridBambuHex;
+      const gN = expPal.gridN || 0;
+      const hW = expPal.halfW || 55;
+      const hH = expPal.halfH || 55;
+
+      for (const [v1, v2, v3] of triangles) {
+        const p1 = vertices[v1];
+        const p2 = vertices[v2];
+        const p3 = vertices[v3];
+        const maxZ = Math.max(p1[2], p2[2], p3[2]);
+
+        let triColorIdx = lowIdx;
+        if (maxZ <= bZ + 0.05) {
+          triColorIdx = lowIdx;
+        } else if (gHex && gN > 0) {
+          const cx = (p1[0] + p2[0] + p3[0]) / 3;
+          const cy = (p1[1] + p2[1] + p3[1]) / 3;
+          const u = Math.max(0, Math.min(1, (cx / hW + 1) * 0.5));
+          const v = Math.max(0, Math.min(1, (cy / hH + 1) * 0.5));
+          const r = Math.min(gN, Math.max(0, Math.round(v * gN)));
+          const c = Math.min(gN, Math.max(0, Math.round(u * gN)));
+          const cellHex = gHex[r]?.[c] || expPal.low;
+          triColorIdx = registerColor(cellHex);
+        } else {
+          const avgZ = (p1[2] + p2[2] + p3[2]) / 3;
+          const normH = Math.max(0, Math.min(1, (avgZ - bZ) / reliefSpan));
+          if (normH >= 0.62) {
+            triColorIdx = highIdx;
+          } else if (normH >= 0.25) {
+            triColorIdx = midIdx;
+          }
+        }
+        coloredTriangles.push([v1, v2, v3, triColorIdx]);
+      }
+    } else {
+      for (const [v1, v2, v3] of triangles) {
+        coloredTriangles.push([v1, v2, v3, defaultColorIdx]);
+      }
+    }
+
+    parts.push({
+      objectId: nextObjId,
+      name: meta.label,
+      defaultColorIdx,
+      vertices,
+      triangles: coloredTriangles,
+    });
+    nextObjId += 1;
+  });
+
+  const assemblyId = nextObjId;
+
+  // Build 3D/3dmodel.model XML using 3MF Material Extension (<m:colorgroup>)
+  const xmlLines: string[] = [];
+  xmlLines.push('<?xml version="1.0" encoding="UTF-8"?>');
+  xmlLines.push(
+    '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:m="http://schemas.microsoft.com/3dmanufacturing/material/2015/02">'
+  );
+  xmlLines.push(`  <metadata name="Title">${escapeXmlAttr(modelName)}</metadata>`);
+  xmlLines.push('  <metadata name="Application">GPX Analyzer &amp; 3D Studio</metadata>');
+  xmlLines.push('  <resources>');
+
+  // 1. 3MF Material Extension Color Group (parsed natively by Bambu Studio / OrcaSlicer / PrusaSlicer)
+  xmlLines.push('    <m:colorgroup id="1">');
+  for (const rgba of colorsRgba) {
+    xmlLines.push(`      <m:color color="${rgba}" />`);
+  }
+  xmlLines.push('    </m:colorgroup>');
+
+  // 2. Individual mesh objects for each multi-color component
+  for (const part of parts) {
+    xmlLines.push(
+      `    <object id="${part.objectId}" name="${escapeXmlAttr(part.name)}" type="model" pid="1" pindex="${part.defaultColorIdx}">`
+    );
+    xmlLines.push('      <mesh>');
+    xmlLines.push('        <vertices>');
+    for (const [vx, vy, vz] of part.vertices) {
+      xmlLines.push(`          <vertex x="${vx}" y="${vy}" z="${vz}" />`);
+    }
+    xmlLines.push('        </vertices>');
+    xmlLines.push('        <triangles>');
+    for (const [v1, v2, v3, cIdx] of part.triangles) {
+      xmlLines.push(
+        `          <triangle v1="${v1}" v2="${v2}" v3="${v3}" pid="1" p1="${cIdx}" p2="${cIdx}" p3="${cIdx}" />`
+      );
+    }
+    xmlLines.push('        </triangles>');
+    xmlLines.push('      </mesh>');
+    xmlLines.push('    </object>');
+  }
+
+  // 3. Parent assembly object grouping all parts in shared coordinate space
+  xmlLines.push(
+    `    <object id="${assemblyId}" name="${escapeXmlAttr(modelName)}" type="model">`
+  );
+  xmlLines.push('      <components>');
+  for (const part of parts) {
+    xmlLines.push(`        <component objectid="${part.objectId}" />`);
+  }
+  xmlLines.push('      </components>');
+  xmlLines.push('    </object>');
+
+  xmlLines.push('  </resources>');
+  xmlLines.push('  <build>');
+  xmlLines.push(`    <item objectid="${assemblyId}" />`);
+  xmlLines.push('  </build>');
+  xmlLines.push('</model>');
+
+  const contentTypesXml = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+    '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml" />',
+    '  <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml" />',
+    '</Types>',
+  ].join('\n');
+
+  const relsXml = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    '  <Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" />',
+    '</Relationships>',
+  ].join('\n');
+
+  const zip = new JSZip();
+  zip.file('[Content_Types].xml', contentTypesXml);
+  zip.folder('_rels')?.file('.rels', relsXml);
+  zip.folder('3D')?.file('3dmodel.model', xmlLines.join('\n'));
+
+  return zip.generateAsync({
+    type: 'blob',
+    mimeType: 'application/vnd.ms-package.3dmanufacturing-3dmodel+xml',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 },
+  });
 }

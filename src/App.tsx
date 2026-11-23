@@ -53,6 +53,13 @@ const GpxTo3DModal = lazy(() =>
 );
 import { fetchTerrainElevations } from './utils/elevationApi';
 import {
+  applyCoordinateFixesToTrack,
+  detectOffRoadAnomalies,
+  fetchOsmRoadsForTrack,
+  OffRoadAnomaly,
+  RoadNetworkData,
+} from './utils/roadAnalysis';
+import {
   ArchiveActivity,
   ArchiveProgress,
   parseStravaArchiveZip,
@@ -70,6 +77,7 @@ export function App() {
   const [focusPointRequest, setFocusPointRequest] = useState<{
     pointId: string;
     metric?: 'elevation' | 'speed';
+    zoomChart?: boolean;
     seq: number;
   } | null>(null);
   const [trimRangeStartId, setTrimRangeStartId] = useState<string | null>(null);
@@ -78,6 +86,9 @@ export function App() {
   const [dragSmoothRadius, setDragSmoothRadius] = useState<number>(0);
   const [spikeJumpThresholdKmh, setSpikeJumpThresholdKmh] = useState<number>(10);
   const [spikeMaxCapKmh, setSpikeMaxCapKmh] = useState<number>(45);
+  const [offRoadThresholdM, setOffRoadThresholdM] = useState<number>(15);
+  const [roadNetwork, setRoadNetwork] = useState<RoadNetworkData | null>(null);
+  const [isScanningRoads, setIsScanningRoads] = useState<boolean>(false);
   const [mapLayer, setMapLayer] = useState<MapLayerType>('osm');
   const [fitTrigger, setFitTrigger] = useState<number>(1);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -140,6 +151,10 @@ export function App() {
     () => detectSpeedSpikes(stats.pointStats, spikeJumpThresholdKmh, spikeMaxCapKmh),
     [stats.pointStats, spikeJumpThresholdKmh, spikeMaxCapKmh]
   );
+  const offRoadAnomalies = useMemo(
+    () => detectOffRoadAnomalies(stats.pointStats, roadNetwork, offRoadThresholdM),
+    [stats.pointStats, roadNetwork, offRoadThresholdM]
+  );
   const timestampHealth = useMemo(() => analyzeTimestampHealth(activeTrack), [activeTrack]);
 
   const showToast = useCallback((msg: string) => {
@@ -199,6 +214,7 @@ export function App() {
         setActiveTrackId(parsed.tracks[0].id);
         setSelectedPointId(null);
         setTerrainElevations({});
+        setRoadNetwork(null);
         setFitTrigger((n) => n + 1);
         showToast(`Loaded ${fileName || 'GPX file'}`);
       } catch (err) {
@@ -761,11 +777,12 @@ export function App() {
   );
 
   const handleFocusPoint = useCallback(
-    (pointId: string, metric?: 'elevation' | 'speed') => {
+    (pointId: string, metric?: 'elevation' | 'speed', zoomChart = true) => {
       setSelectedPointId(pointId);
       setFocusPointRequest((prev) => ({
         pointId,
         metric,
+        zoomChart,
         seq: (prev?.seq ?? 0) + 1,
       }));
     },
@@ -781,6 +798,79 @@ export function App() {
     handleFocusPoint(best.point.id, 'speed');
     showToast(`Zoomed to max speed point #${best.index + 1} (${best.speedKmh.toFixed(1)} km/h)`);
   }, [stats.pointStats, handleFocusPoint, showToast]);
+
+  const handleScanOsmRoads = useCallback(async () => {
+    if (!activeTrack) return;
+    const pts = activeTrack.segments.flatMap((s) => s.points);
+    if (pts.length < 2) return;
+    setIsScanningRoads(true);
+    try {
+      const net = await fetchOsmRoadsForTrack(activeTrack);
+      setRoadNetwork(net);
+      const found = detectOffRoadAnomalies(stats.pointStats, net, offRoadThresholdM);
+      showToast(
+        `Scanned ${net.roads.length} OSM roads — found ${found.length} off-road excursion${
+          found.length === 1 ? '' : 's'
+        }`
+      );
+    } catch (err) {
+      alert(
+        err instanceof Error
+          ? `OSM Road Scan failed: ${err.message}`
+          : 'Failed to fetch OpenStreetMap roads.'
+      );
+    } finally {
+      setIsScanningRoads(false);
+    }
+  }, [activeTrack, stats.pointStats, offRoadThresholdM, showToast]);
+
+  const handleFixOffRoadAnomaly = useCallback(
+    (anomaly: OffRoadAnomaly, mode: 'road' | 'neighbors') => {
+      if (!activeTrack) return;
+      const coords = mode === 'road' ? anomaly.roadSnapCoords : anomaly.neighborAlignCoords;
+      let count = 0;
+      commitDoc((prev) => {
+        const res = applyCoordinateFixesToTrack(prev, activeTrack.id, coords);
+        count = res.updatedCount;
+        return res.doc;
+      });
+      if (count > 0) {
+        showToast(
+          mode === 'road'
+            ? `Snapped ${count} off-road point${count > 1 ? 's' : ''} onto ${
+                anomaly.roadName || 'road'
+              }`
+            : `Aligned ${count} off-road point${count > 1 ? 's' : ''} to on-road neighbors`
+        );
+      }
+    },
+    [activeTrack, commitDoc, showToast]
+  );
+
+  const handleFixAllOffRoad = useCallback(
+    (mode: 'road' | 'neighbors') => {
+      if (!activeTrack || offRoadAnomalies.length === 0) return;
+      const allCoords: Record<string, { lat: number; lon: number }> = {};
+      for (const anom of offRoadAnomalies) {
+        const src = mode === 'road' ? anom.roadSnapCoords : anom.neighborAlignCoords;
+        Object.assign(allCoords, src);
+      }
+      let count = 0;
+      commitDoc((prev) => {
+        const res = applyCoordinateFixesToTrack(prev, activeTrack.id, allCoords);
+        count = res.updatedCount;
+        return res.doc;
+      });
+      if (count > 0) {
+        showToast(
+          mode === 'road'
+            ? `Snapped all ${count} off-road point${count > 1 ? 's' : ''} onto road`
+            : `Aligned all ${count} off-road point${count > 1 ? 's' : ''} to on-road neighbors`
+        );
+      }
+    },
+    [activeTrack, offRoadAnomalies, commitDoc, showToast]
+  );
 
   const handleRepairTimestamps = useCallback(() => {
     const targetId = activeTrack?.id || doc.tracks[0]?.id;
@@ -1227,7 +1317,6 @@ export function App() {
             setSelectedPointId(null);
             setFitTrigger((n) => n + 1);
           }}
-          onSelectPoint={setSelectedPointId}
           onFocusPoint={handleFocusPoint}
           onHoverPoint={setHoveredPointId}
           onUpdatePoint={handleUpdatePoint}
@@ -1251,6 +1340,15 @@ export function App() {
           spikeMaxCapKmh={spikeMaxCapKmh}
           onChangeSpikeJumpThreshold={setSpikeJumpThresholdKmh}
           onChangeSpikeMaxCap={setSpikeMaxCapKmh}
+          offRoadAnomalies={offRoadAnomalies}
+          offRoadThresholdM={offRoadThresholdM}
+          onChangeOffRoadThreshold={setOffRoadThresholdM}
+          hasRoadNetwork={roadNetwork !== null && roadNetwork.roads.length > 0}
+          roadCount={roadNetwork?.roads.length ?? 0}
+          isScanningRoads={isScanningRoads}
+          onScanOsmRoads={handleScanOsmRoads}
+          onFixOffRoadAnomaly={handleFixOffRoadAnomaly}
+          onFixAllOffRoad={handleFixAllOffRoad}
           onJumpToMaxSpeed={handleJumpToMaxSpeed}
           onRepairTimestamps={handleRepairTimestamps}
           onUpdateMetadata={handleUpdateMetadata}
@@ -1273,6 +1371,8 @@ export function App() {
               hoveredPointId={hoveredPointId}
               focusPointRequest={focusPointRequest}
               trimRangeIndices={trimRangeIndices}
+              offRoadAnomalies={offRoadAnomalies}
+              onFixOffRoadAnomaly={handleFixOffRoadAnomaly}
               terrainElevations={terrainElevations}
               onlyTerrain={onlyTerrain}
               editMode={editMode}
@@ -1313,7 +1413,7 @@ export function App() {
               onToggleOnlyTerrain={() => setOnlyTerrain((v) => !v)}
               onFetchTerrain={handleFetchTerrain}
               onApplyTerrain={handleApplyTerrain}
-              onSelectPoint={setSelectedPointId}
+              onSelectPoint={(ptId) => handleFocusPoint(ptId, undefined, false)}
               onHoverPoint={setHoveredPointId}
               onAdjustPointValue={handleAdjustChartValue}
             />

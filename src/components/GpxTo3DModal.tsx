@@ -13,13 +13,20 @@ import {
 } from 'lucide-react';
 import { TrackPoint } from '../types/gpx';
 import {
+  BAMBU_FILAMENT_PALETTE,
+  BambuColorMapping,
+  BambuColorRole,
   BaseShape3D,
   buildTerrainSceneObjects,
+  ColorReductionCount,
   ColorTheme3D,
+  computeAutoBambuColorMapping,
   computeTrackAspect,
+  getBambuSwatchByHex,
   getTargetAspect,
   PlaquePosition3D,
   DemGridData,
+  exportSceneTo3mf,
   exportSceneToBinaryStl,
   fetchMap3DTerrainAndTextures,
   Terrain3DOptions,
@@ -172,6 +179,71 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
   const [topoCanvas, setTopoCanvas] = useState<HTMLCanvasElement | null>(null);
   const [isFetchingDem, setIsFetchingDem] = useState(false);
 
+  const activeTextureCanvas = useMemo(() => {
+    if (theme === 'satellite') return satelliteCanvas;
+    if (theme === 'topo') return topoCanvas;
+    return null;
+  }, [theme, satelliteCanvas, topoCanvas]);
+
+  // Bambu AMS Multi-Color Print Preview & Color Reduction (4 or 7 colors from 27-swatch Bambu palette)
+  const [bambuPreviewEnabled, setBambuPreviewEnabled] = useState<boolean>(false);
+  const [bambuColorCount, setBambuColorCount] = useState<ColorReductionCount>(4);
+  const [bambuColorMapping, setBambuColorMapping] = useState<BambuColorMapping>(() =>
+    computeAutoBambuColorMapping(
+      {
+        theme: 'satellite',
+        customLowColor: '#2a703e',
+        customHighColor: '#f5f7fa',
+        customTrackColor: '#fc4c02',
+        customBaseColor: '#1e293b',
+      },
+      4
+    )
+  );
+  const [activeSwatchSlot, setActiveSwatchSlot] = useState<string | null>(null);
+
+  const handleRemixBambuColors = (targetCount: ColorReductionCount = bambuColorCount) => {
+    const autoMap = computeAutoBambuColorMapping(
+      {
+        theme,
+        customLowColor,
+        customHighColor,
+        customTrackColor,
+        customBaseColor,
+      },
+      targetCount,
+      activeTextureCanvas,
+      demGrid
+    );
+    setBambuColorMapping(autoMap);
+  };
+
+  // Automatically re-match Bambu palette when user switches visual theme, custom colors, or satellite/topo tiles finish loading
+  useEffect(() => {
+    const autoMap = computeAutoBambuColorMapping(
+      {
+        theme,
+        customLowColor,
+        customHighColor,
+        customTrackColor,
+        customBaseColor,
+      },
+      bambuColorCount,
+      activeTextureCanvas,
+      demGrid
+    );
+    setBambuColorMapping(autoMap);
+  }, [
+    theme,
+    customLowColor,
+    customHighColor,
+    customTrackColor,
+    customBaseColor,
+    bambuColorCount,
+    activeTextureCanvas,
+    demGrid,
+  ]);
+
   const [modelStats, setModelStats] = useState({
     triangleCount: 0,
     widthMm: 110,
@@ -216,12 +288,6 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [points, fetchKey]);
 
-  const activeTextureCanvas = useMemo(() => {
-    if (theme === 'satellite') return satelliteCanvas;
-    if (theme === 'topo') return topoCanvas;
-    return null;
-  }, [theme, satelliteCanvas, topoCanvas]);
-
   const options: Terrain3DOptions = useMemo(
     () => ({
       baseShape,
@@ -255,6 +321,9 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       customHighColor,
       customTrackColor,
       customBaseColor,
+      bambuPreviewEnabled,
+      bambuColorCount,
+      bambuColorMapping,
     }),
     [
       baseShape,
@@ -288,6 +357,9 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       customHighColor,
       customTrackColor,
       customBaseColor,
+      bambuPreviewEnabled,
+      bambuColorCount,
+      bambuColorMapping,
     ]
   );
 
@@ -357,6 +429,7 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
     scene.add(dirLight);
 
     const fillLight = new THREE.DirectionalLight(0x93c5fd, 0.45);
+    fillLight.name = 'fillLight';
     fillLight.position.set(80, 90, 80);
     scene.add(fillLight);
 
@@ -431,6 +504,22 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
     }
   }, [points, terrainElevations, demGrid, activeTextureCanvas, buildOptions]);
 
+  // ACES tone mapping shifts and desaturates hues (greens drift toward olive/brown).
+  // In filament preview, use Neutral tone mapping so swatches look like the spool.
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    renderer.toneMapping = bambuPreviewEnabled
+      ? THREE.NeutralToneMapping
+      : THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = bambuPreviewEnabled ? 1.0 : 1.15;
+    // The blue fill light tints greens toward teal/gray; keep it white in preview
+    const fill = sceneRef.current?.getObjectByName('fillLight');
+    if (fill instanceof THREE.DirectionalLight) {
+      fill.color.set(bambuPreviewEnabled ? 0xffffff : 0x93c5fd);
+    }
+  }, [bambuPreviewEnabled]);
+
   // Preset Camera Views
   const setPresetView = (view: 'iso' | 'top' | 'front') => {
     const camera = cameraRef.current;
@@ -466,6 +555,29 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
     a.click();
     // Revoking synchronously can cancel the download in some browsers
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // Export to Multi-Color 3MF (Bambu Studio / OrcaSlicer / PrusaSlicer)
+  const [isExporting3mf, setIsExporting3mf] = useState(false);
+  const handleExport3mf = async () => {
+    if (!exportGroupRef.current || isExporting3mf) return;
+    const safeName =
+      (titleText || trackName || 'gpx_3d_terrain')
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .replace(/_+/g, '_') || 'gpx_3d_terrain';
+
+    setIsExporting3mf(true);
+    try {
+      const blob = await exportSceneTo3mf(exportGroupRef.current, safeName);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${safeName}.3mf`;
+      a.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } finally {
+      setIsExporting3mf(false);
+    }
   };
 
   // Export High-Res PNG Screenshot
@@ -1388,7 +1500,365 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
               </div>
             </div>
 
-            {/* Action Buttons: STL & PNG Export */}
+            {/* Bambu Lab Multi-Color Print Preview, Color Reduction (4 or 7) & 27-Color Palette Matcher */}
+            <div
+              className="share-control-group"
+              style={{
+                backgroundColor: bambuPreviewEnabled
+                  ? 'rgba(16, 185, 129, 0.08)'
+                  : 'rgba(15, 23, 42, 0.75)',
+                border: bambuPreviewEnabled
+                  ? '1px solid rgba(16, 185, 129, 0.45)'
+                  : '1px solid #1e293b',
+                borderRadius: '8px',
+                padding: '10px',
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+              >
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 7,
+                    cursor: 'pointer',
+                    fontWeight: 600,
+                    margin: 0,
+                    color: bambuPreviewEnabled ? '#34d399' : '#e2e8f0',
+                    fontSize: '0.8rem',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={bambuPreviewEnabled}
+                    onChange={(e) => setBambuPreviewEnabled(e.target.checked)}
+                    style={{
+                      cursor: 'pointer',
+                      width: 15,
+                      height: 15,
+                      accentColor: '#10b981',
+                    }}
+                  />
+                  <span>Preview .3MF Print Colors (Bambu)</span>
+                </label>
+                <button
+                  className="btn-secondary-sm"
+                  style={{ padding: '2px 7px', fontSize: '0.7rem' }}
+                  onClick={() => {
+                    handleRemixBambuColors(bambuColorCount);
+                    setBambuPreviewEnabled(true);
+                  }}
+                  title="Auto-match and remix theme colors to the closest 27 Bambu Lab filament swatches"
+                >
+                  <Sparkles size={11} />
+                  <span>Auto-Match</span>
+                </button>
+              </div>
+
+              {/* Color Reduction Selector: 4 Colors (1x AMS) vs 7 Colors (2x AMS) */}
+              <div style={{ marginTop: 8 }}>
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    marginBottom: 4,
+                  }}
+                >
+                  <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>
+                    Color Reduction &amp; Filament Slots
+                  </span>
+                  <span style={{ fontSize: '0.7rem', color: '#34d399', fontWeight: 600 }}>
+                    {bambuColorCount} Colors Matched
+                  </span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  <button
+                    className={`btn-secondary-sm ${bambuColorCount === 4 ? 'btn-active' : ''}`}
+                    style={{
+                      justifyContent: 'center',
+                      padding: '5px 4px',
+                      fontSize: '0.74rem',
+                      fontWeight: bambuColorCount === 4 ? 600 : 400,
+                    }}
+                    onClick={() => {
+                      setBambuColorCount(4);
+                      setActiveSwatchSlot(null);
+                      setBambuPreviewEnabled(true);
+                    }}
+                  >
+                    4 Colors (1× AMS)
+                  </button>
+                  <button
+                    className={`btn-secondary-sm ${bambuColorCount === 7 ? 'btn-active' : ''}`}
+                    style={{
+                      justifyContent: 'center',
+                      padding: '5px 4px',
+                      fontSize: '0.74rem',
+                      fontWeight: bambuColorCount === 7 ? 600 : 400,
+                    }}
+                    onClick={() => {
+                      setBambuColorCount(7);
+                      setActiveSwatchSlot(null);
+                      setBambuPreviewEnabled(true);
+                    }}
+                  >
+                    7 Colors (2× AMS)
+                  </button>
+                </div>
+              </div>
+
+              {/* Active Filament Slots List */}
+              {(() => {
+                const slots: Array<{
+                  id: string;
+                  label: string;
+                  hex: string;
+                  roles: BambuColorRole[];
+                }> =
+                  bambuColorCount === 4
+                    ? [
+                        {
+                          id: 'slot1',
+                          label: '1. Base & Plaque',
+                          hex: bambuColorMapping.base,
+                          roles: ['base'],
+                        },
+                        {
+                          id: 'slot2',
+                          label: '2. Terrain Relief',
+                          hex: bambuColorMapping.terrainLow,
+                          roles: ['terrainLow', 'terrainMid'],
+                        },
+                        {
+                          id: 'slot3',
+                          label: '3. Track & Pins',
+                          hex: bambuColorMapping.track,
+                          roles: ['track', 'markers'],
+                        },
+                        {
+                          id: 'slot4',
+                          label: '4. Text & Peaks',
+                          hex: bambuColorMapping.text,
+                          roles: ['text', 'terrainHigh'],
+                        },
+                      ]
+                    : [
+                        {
+                          id: 'slot1',
+                          label: '1. Base & Plaque',
+                          hex: bambuColorMapping.base,
+                          roles: ['base'],
+                        },
+                        {
+                          id: 'slot2',
+                          label: '2. Valley Relief',
+                          hex: bambuColorMapping.terrainLow,
+                          roles: ['terrainLow'],
+                        },
+                        {
+                          id: 'slot3',
+                          label: '3. Mid Slope',
+                          hex: bambuColorMapping.terrainMid,
+                          roles: ['terrainMid'],
+                        },
+                        {
+                          id: 'slot4',
+                          label: '4. Peak Summit',
+                          hex: bambuColorMapping.terrainHigh,
+                          roles: ['terrainHigh'],
+                        },
+                        {
+                          id: 'slot5',
+                          label: '5. GPS Track',
+                          hex: bambuColorMapping.track,
+                          roles: ['track'],
+                        },
+                        {
+                          id: 'slot6',
+                          label: '6. Plaque Text',
+                          hex: bambuColorMapping.text,
+                          roles: ['text'],
+                        },
+                        {
+                          id: 'slot7',
+                          label: '7. Start Marker',
+                          hex: bambuColorMapping.markers,
+                          roles: ['markers'],
+                        },
+                      ];
+
+                const selectedSlot = slots.find((s) => s.id === activeSwatchSlot) || null;
+
+                return (
+                  <div style={{ marginTop: 8 }}>
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '1fr 1fr',
+                        gap: 5,
+                      }}
+                    >
+                      {slots.map((slot) => {
+                        const swatchInfo = getBambuSwatchByHex(slot.hex);
+                        const isEditing = activeSwatchSlot === slot.id;
+                        return (
+                          <button
+                            key={slot.id}
+                            type="button"
+                            onClick={() => {
+                              setActiveSwatchSlot(isEditing ? null : slot.id);
+                              setBambuPreviewEnabled(true);
+                            }}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              padding: '5px 6px',
+                              borderRadius: '6px',
+                              backgroundColor: isEditing
+                                ? 'rgba(16, 185, 129, 0.22)'
+                                : '#090d16',
+                              border: isEditing
+                                ? '1.5px solid #10b981'
+                                : '1px solid #334155',
+                              cursor: 'pointer',
+                              textAlign: 'left',
+                              color: '#e2e8f0',
+                            }}
+                            title={`${slot.label}: ${swatchInfo.name} (${swatchInfo.hex}) — Click to pick from the 27-color Bambu palette`}
+                          >
+                            <span
+                              style={{
+                                width: 16,
+                                height: 16,
+                                borderRadius: 3,
+                                backgroundColor: slot.hex,
+                                border:
+                                  slot.hex.toUpperCase() === '#FFFFFF'
+                                    ? '1px solid #64748b'
+                                    : '1px solid rgba(255,255,255,0.25)',
+                                flexShrink: 0,
+                              }}
+                            />
+                            <div style={{ overflow: 'hidden', lineHeight: 1.15 }}>
+                              <div
+                                style={{
+                                  fontSize: '0.69rem',
+                                  fontWeight: 600,
+                                  whiteSpace: 'nowrap',
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                }}
+                              >
+                                {slot.label}
+                              </div>
+                              <div
+                                style={{
+                                  fontSize: '0.63rem',
+                                  color: '#94a3b8',
+                                  whiteSpace: 'nowrap',
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                }}
+                              >
+                                {swatchInfo.name}
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* 3x9 Bambu Lab 27-Color Swatch Grid (matching user screenshot) */}
+                    {selectedSlot && (
+                      <div
+                        style={{
+                          marginTop: 8,
+                          padding: '8px',
+                          backgroundColor: '#ffffff',
+                          borderRadius: '6px',
+                          border: '1px solid #cbd5e1',
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            marginBottom: 6,
+                          }}
+                        >
+                          <span
+                            style={{
+                              fontSize: '0.7rem',
+                              fontWeight: 700,
+                              color: '#0f172a',
+                            }}
+                          >
+                            Pick Swatch for {selectedSlot.label}:
+                          </span>
+                          <span style={{ fontSize: '0.67rem', color: '#475569' }}>
+                            {getBambuSwatchByHex(selectedSlot.hex).name} ({selectedSlot.hex})
+                          </span>
+                        </div>
+                        <div
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(9, 1fr)',
+                            gap: 5,
+                          }}
+                        >
+                          {BAMBU_FILAMENT_PALETTE.map((sw) => {
+                            const isSelected =
+                              sw.hex.toUpperCase() === selectedSlot.hex.toUpperCase();
+                            return (
+                              <button
+                                key={sw.hex}
+                                type="button"
+                                onClick={() => {
+                                  setBambuColorMapping((prev) => {
+                                    const next = { ...prev };
+                                    for (const r of selectedSlot.roles) {
+                                      next[r] = sw.hex;
+                                    }
+                                    return next;
+                                  });
+                                  setBambuPreviewEnabled(true);
+                                }}
+                                title={`${sw.name} (${sw.hex})`}
+                                style={{
+                                  width: '100%',
+                                  aspectRatio: '1 / 1',
+                                  backgroundColor: sw.hex,
+                                  border:
+                                    sw.hex === '#FFFFFF'
+                                      ? '1px solid #94a3b8'
+                                      : '1px solid rgba(0,0,0,0.15)',
+                                  outline: isSelected ? '2.5px solid #00AE42' : 'none',
+                                  outlineOffset: '1px',
+                                  borderRadius: 2,
+                                  cursor: 'pointer',
+                                  padding: 0,
+                                }}
+                              />
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* Action Buttons: 3MF, STL & PNG Export */}
             <div
               style={{
                 display: 'flex',
@@ -1400,7 +1870,8 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
             >
               <button
                 className="btn-primary"
-                onClick={handleExportStl}
+                onClick={handleExport3mf}
+                disabled={isExporting3mf}
                 style={{
                   padding: '9px 12px',
                   display: 'flex',
@@ -1409,10 +1880,31 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
                   gap: 8,
                   fontSize: '0.88rem',
                   fontWeight: 600,
+                  background: '#10b981',
+                }}
+                title="Export a multi-part, pre-colored .3mf project file for Bambu Studio / OrcaSlicer / PrusaSlicer multi-color AMS printing"
+              >
+                <Download size={16} />
+                <span>
+                  {isExporting3mf ? 'Packaging .3MF...' : 'Export Multi-Color .3MF (Bambu)'}
+                </span>
+              </button>
+
+              <button
+                className="btn-primary"
+                onClick={handleExportStl}
+                style={{
+                  padding: '8px 12px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 8,
+                  fontSize: '0.84rem',
+                  fontWeight: 600,
                 }}
               >
                 <Download size={16} />
-                <span>Export 3D Printable STL</span>
+                <span>Export Single-Mesh .STL</span>
               </button>
 
               <button

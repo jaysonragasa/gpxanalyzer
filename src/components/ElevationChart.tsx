@@ -19,7 +19,12 @@ interface ElevationChartProps {
   detectedSpikes?: SpeedSpikeAnomaly[];
   selectedPointId: string | null;
   hoveredPointId: string | null;
-  focusPointRequest?: { pointId: string; metric?: 'elevation' | 'speed'; seq: number } | null;
+  focusPointRequest?: {
+    pointId: string;
+    metric?: 'elevation' | 'speed';
+    zoomChart?: boolean;
+    seq: number;
+  } | null;
   trimRangeIndices?: [number, number] | null;
   terrainElevations?: Record<string, number>;
   isFetchingTerrain?: boolean;
@@ -91,7 +96,7 @@ export const ElevationChart: React.FC<ElevationChartProps> = ({
 
   // Zoom & center chart on requested focus point (and switch to requested metric tab)
   useEffect(() => {
-    if (!focusPointRequest || pointStats.length < 2) return;
+    if (!focusPointRequest || focusPointRequest.zoomChart === false || pointStats.length < 2) return;
     if (focusPointRequest.metric) {
       setMetric(focusPointRequest.metric);
     }
@@ -439,7 +444,7 @@ export const ElevationChart: React.FC<ElevationChartProps> = ({
     onHoverPoint(pointStats[lo].point.id);
   };
 
-  const handleMouseUp = () => {
+  const handleMouseUp = (e: React.MouseEvent<SVGSVGElement>) => {
     if (dragPreview && onAdjustPointValue) {
       const radius = dragMode === 'smooth' ? SMOOTH_RADIUS : 0;
       onAdjustPointValue(dragPreview.pointId, metric, dragPreview.newValue, radius);
@@ -450,8 +455,17 @@ export const ElevationChart: React.FC<ElevationChartProps> = ({
     const wasMoved = panStateRef.current.moved;
     panStateRef.current.active = false;
     setIsPanning(false);
-    if (!wasMoved && hoveredPointId) {
-      onSelectPoint(hoveredPointId);
+    if (!wasMoved) {
+      let targetPointId = hoveredPointId;
+      if (!targetPointId && chartData && pointStats.length > 0) {
+        const targetDist = getDistAtClientX(e.clientX);
+        if (targetDist !== null) {
+          targetPointId = pointStats[findNearestIndex(targetDist)]?.point.id ?? null;
+        }
+      }
+      if (targetPointId) {
+        onSelectPoint(targetPointId);
+      }
     }
   };
 

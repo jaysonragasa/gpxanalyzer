@@ -3,6 +3,7 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { GpxTrack, MapEditMode, MapLayerType, TrackPoint, Waypoint } from '../types/gpx';
 import { getGoogleStreetViewUrl, getGradeColor, haversineDistanceM } from '../utils/gpxParser';
+import { OffRoadAnomaly } from '../utils/roadAnalysis';
 import { ExternalLink, Link2, LocateFixed, MapPin, MousePointer, PlusCircle } from 'lucide-react';
 
 interface MapEditorProps {
@@ -12,6 +13,8 @@ interface MapEditorProps {
   hoveredPointId: string | null;
   focusPointRequest?: { pointId: string; metric?: 'elevation' | 'speed'; seq: number } | null;
   trimRangeIndices?: [number, number] | null;
+  offRoadAnomalies?: OffRoadAnomaly[];
+  onFixOffRoadAnomaly?: (anomaly: OffRoadAnomaly, mode: 'road' | 'neighbors') => void;
   terrainElevations?: Record<string, number>;
   onlyTerrain?: boolean;
   editMode: MapEditMode;
@@ -62,6 +65,8 @@ export const MapEditor: React.FC<MapEditorProps> = ({
   hoveredPointId,
   focusPointRequest = null,
   trimRangeIndices = null,
+  offRoadAnomalies = [],
+  onFixOffRoadAnomaly,
   terrainElevations,
   onlyTerrain = false,
   editMode,
@@ -85,7 +90,7 @@ export const MapEditor: React.FC<MapEditorProps> = ({
   const trackLayerGroupRef = useRef<L.LayerGroup | null>(null);
   const markersLayerGroupRef = useRef<L.LayerGroup | null>(null);
   const previewLayerGroupRef = useRef<L.LayerGroup | null>(null);
-  const hoverMarkerRef = useRef<L.CircleMarker | null>(null);
+  const hoverMarkerRef = useRef<L.Marker | null>(null);
 
   const [connectStartId, setConnectStartId] = useState<string | null>(null);
   const [viewRevision, setViewRevision] = useState<number>(0);
@@ -138,6 +143,7 @@ export const MapEditor: React.FC<MapEditorProps> = ({
     onMovePoint,
     onDeletePoint,
     onConnectPoints,
+    onFixOffRoadAnomaly,
     onAddPoint,
     onAddWaypoint,
     handlePointClick,
@@ -150,6 +156,7 @@ export const MapEditor: React.FC<MapEditorProps> = ({
     onMovePoint,
     onDeletePoint,
     onConnectPoints,
+    onFixOffRoadAnomaly,
     onAddPoint,
     onAddWaypoint,
     handlePointClick,
@@ -441,6 +448,48 @@ export const MapEditor: React.FC<MapEditorProps> = ({
         }
       }
 
+      // Highlight detected off-road excursions & green suggested on-road snap path
+      const offRoadPointSet = new Set<string>();
+      for (const anom of offRoadAnomalies) {
+        for (const pid of anom.pointIds) offRoadPointSet.add(pid);
+
+        if (anom.originalPath.length >= 2) {
+          L.polyline(anom.originalPath, {
+            color: '#ec4899',
+            weight: 5,
+            opacity: 0.85,
+            dashArray: '5 5',
+          })
+            .bindTooltip(
+              `Off-Road Detour (#${anom.startIndex + 1}${
+                anom.endIndex > anom.startIndex ? `–#${anom.endIndex + 1}` : ''
+              } • ${anom.maxOffRoadDistM.toFixed(0)} m off road)`,
+              { sticky: true, direction: 'top' }
+            )
+            .addTo(trackGroup);
+        }
+
+        if (anom.suggestedPath.length >= 2) {
+          const snapLine = L.polyline(anom.suggestedPath, {
+            color: '#10b981',
+            weight: 5,
+            opacity: 0.92,
+            dashArray: '7 5',
+          });
+          snapLine.bindTooltip(
+            `Suggested Road Path${anom.roadName ? ` (${anom.roadName})` : ''}<br/><b>Click to snap ${
+              anom.pointIds.length
+            } off-road point${anom.pointIds.length > 1 ? 's' : ''} onto road</b>`,
+            { sticky: true, direction: 'top' }
+          );
+          snapLine.on('click', (ev) => {
+            L.DomEvent.stopPropagation(ev);
+            callbacksRef.current.onFixOffRoadAnomaly?.(anom, 'road');
+          });
+          snapLine.addTo(trackGroup);
+        }
+      }
+
       // Start & End markers
       if (allPoints.length > 0) {
         const start = allPoints[0];
@@ -493,12 +542,13 @@ export const MapEditor: React.FC<MapEditorProps> = ({
           indicesToRender.add(inViewIndices[k]);
         }
 
-        // Always render selected point, connect anchor point, and segment gap endpoints
+        // Always render selected point, connect anchor point, off-road points, and segment gap endpoints
         for (let i = 0; i < allPoints.length; i += 1) {
           const ptId = allPoints[i].id;
           if (
             ptId === selectedPointId ||
             ptId === connectStartId ||
+            offRoadPointSet.has(ptId) ||
             segmentEndpointIds.has(ptId)
           ) {
             indicesToRender.add(i);
@@ -509,31 +559,45 @@ export const MapEditor: React.FC<MapEditorProps> = ({
           const pt = allPoints[idx];
           const isSelected = pt.id === selectedPointId;
           const isConnectAnchor = pt.id === connectStartId;
+          const isOffRoad = offRoadPointSet.has(pt.id);
           const isGapEndpoint =
             segmentEndpointIds.has(pt.id) &&
             idx !== 0 &&
             idx !== allPoints.length - 1;
 
           let size = 10;
-          let bg = '#f97316';
+          let bg = '#fb923c';
           let border = '2px solid #ffffff';
-          let shadow = '0 1px 3px rgba(0,0,0,0.45)';
+          let shadow = '0 1px 3px rgba(0,0,0,0.5)';
           let zOffset = 100;
+          let innerDotHtml = '';
 
           if (isConnectAnchor) {
-            size = 18;
+            size = 24;
             bg = '#06b6d4';
             border = '3px solid #ffffff';
-            shadow = '0 0 0 4px rgba(6,182,212,0.45), 0 2px 6px rgba(0,0,0,0.6)';
-            zOffset = 1200;
+            shadow =
+              '0 0 0 3px #0f172a, 0 0 0 7px rgba(6,182,212,0.55), 0 4px 10px rgba(0,0,0,0.75)';
+            zOffset = 12000;
+            innerDotHtml =
+              '<div style="width:6px;height:6px;border-radius:50%;background:#ffffff;"></div>';
           } else if (isSelected) {
-            size = 18;
-            bg = '#3b82f6';
+            size = 24;
+            bg = '#d946ef';
             border = '3px solid #ffffff';
-            shadow = '0 0 0 3px rgba(59,130,246,0.45), 0 2px 6px rgba(0,0,0,0.5)';
-            zOffset = 1000;
+            shadow =
+              '0 0 0 3px #0f172a, 0 0 0 7px rgba(217,70,239,0.6), 0 4px 10px rgba(0,0,0,0.75)';
+            zOffset = 10000;
+            innerDotHtml =
+              '<div style="width:6px;height:6px;border-radius:50%;background:#ffffff;"></div>';
+          } else if (isOffRoad) {
+            size = 14;
+            bg = '#f43f5e';
+            border = '2px solid #ffffff';
+            shadow = '0 0 0 3px rgba(244,63,94,0.45), 0 1px 4px rgba(0,0,0,0.5)';
+            zOffset = 700;
           } else if (isGapEndpoint) {
-            size = 13;
+            size = 14;
             bg = '#38bdf8';
             border = '2px solid #ffffff';
             shadow = '0 0 0 2px rgba(56,189,248,0.4), 0 1px 4px rgba(0,0,0,0.5)';
@@ -543,7 +607,7 @@ export const MapEditor: React.FC<MapEditorProps> = ({
           const cursor = editMode === 'connect' ? 'pointer' : 'grab';
           const icon = L.divIcon({
             className: 'gpx-vertex-handle',
-            html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:${bg};border:${border};box-shadow:${shadow};cursor:${cursor};box-sizing:border-box;"></div>`,
+            html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:${bg};border:${border};box-shadow:${shadow};cursor:${cursor};box-sizing:border-box;display:flex;align-items:center;justify-content:center;">${innerDotHtml}</div>`,
             iconSize: [size, size],
             iconAnchor: [size / 2, size / 2],
           });
@@ -615,9 +679,9 @@ export const MapEditor: React.FC<MapEditorProps> = ({
               ? connectStartId
                 ? `Point #${idx + 1}<br/><b>Click to connect Point A → here</b>`
                 : `Point #${idx + 1}<br/><b>Click to set as Point A</b>`
-              : `Point #${idx + 1}${isGapEndpoint ? ' (Gap Endpoint)' : ''}<br/>${pt.lat.toFixed(
-                  5
-                )}, ${pt.lon.toFixed(5)}${
+              : `Point #${idx + 1}${isOffRoad ? ' (Off-Road Detected)' : ''}${
+                  isGapEndpoint ? ' (Gap Endpoint)' : ''
+                }<br/>${pt.lat.toFixed(5)}, ${pt.lon.toFixed(5)}${
                   pt.ele !== undefined ? `<br/>Ele: ${pt.ele.toFixed(1)} m` : ''
                 }<br/><i>Drag to move • Right-click to delete</i>`;
 
@@ -652,6 +716,7 @@ export const MapEditor: React.FC<MapEditorProps> = ({
     terrainElevations,
     onlyTerrain,
     trimRangeIndices,
+    offRoadAnomalies,
     viewRevision,
   ]);
 
@@ -676,13 +741,19 @@ export const MapEditor: React.FC<MapEditorProps> = ({
     if (hoverIdx === -1) return;
     const pt = allPts[hoverIdx];
 
-    hoverMarkerRef.current = L.circleMarker([pt.lat, pt.lon], {
-      radius: 7,
-      color: '#ffffff',
-      weight: 2,
-      fillColor: editMode === 'connect' ? '#06b6d4' : '#eab308',
-      fillOpacity: 1,
+    const hoverColor = editMode === 'connect' ? '#06b6d4' : '#facc15';
+    const hoverGlow = editMode === 'connect' ? 'rgba(6,182,212,0.6)' : 'rgba(250,204,21,0.65)';
+    const hoverIcon = L.divIcon({
+      className: 'gpx-hover-point-marker',
+      html: `<div style="width:22px;height:22px;border-radius:50%;background:${hoverColor};border:3px solid #0f172a;box-shadow:0 0 0 2px #ffffff, 0 0 0 6px ${hoverGlow}, 0 3px 8px rgba(0,0,0,0.75);box-sizing:border-box;display:flex;align-items:center;justify-content:center;pointer-events:none;"><div style="width:6px;height:6px;border-radius:50%;background:#0f172a;"></div></div>`,
+      iconSize: [22, 22],
+      iconAnchor: [11, 11],
+    });
+
+    hoverMarkerRef.current = L.marker([pt.lat, pt.lon], {
+      icon: hoverIcon,
       interactive: false,
+      zIndexOffset: 15000,
     }).addTo(map);
 
     // In Connect mode with Point A chosen, show live preview line A -> hovered B
