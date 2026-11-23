@@ -1522,7 +1522,7 @@ export function buildTerrainSceneObjects(
       const line2 = line2Parts.join('  •  ');
       const h2 = Math.max(2.6, h1 * 0.62);
       // Line 3: Duration • Max Altitude
-      const line3Parts = [durStr, eleStr ? `MAX ALT ${eleStr}` : ''].filter(Boolean);
+      const line3Parts = [durStr, eleStr ? `MAX ELV ${eleStr}` : ''].filter(Boolean);
       const line3 = line3Parts.join('  •  ');
       const h3 = Math.max(2.6, h1 * 0.62);
 
