@@ -1,23 +1,28 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { GpxTrack, MapEditMode, MapLayerType, TrackPoint, Waypoint } from '../types/gpx';
 import { getGoogleStreetViewUrl, getGradeColor, haversineDistanceM } from '../utils/gpxParser';
-import { ExternalLink, LocateFixed, MapPin, MousePointer, PlusCircle } from 'lucide-react';
+import { ExternalLink, Link2, LocateFixed, MapPin, MousePointer, PlusCircle } from 'lucide-react';
 
 interface MapEditorProps {
   track: GpxTrack | undefined;
   waypoints: Waypoint[];
   selectedPointId: string | null;
   hoveredPointId: string | null;
+  focusPointRequest?: { pointId: string; metric?: 'elevation' | 'speed'; seq: number } | null;
   trimRangeIndices?: [number, number] | null;
   terrainElevations?: Record<string, number>;
   onlyTerrain?: boolean;
   editMode: MapEditMode;
   mapLayer: MapLayerType;
+  dragSmoothRadius: number;
+  onChangeDragSmoothRadius: (radius: number) => void;
   onSelectPoint: (pointId: string) => void;
   onHoverPoint: (pointId: string | null) => void;
-  onMovePoint: (pointId: string, lat: number, lon: number) => void;
+  onMovePoint: (pointId: string, lat: number, lon: number, smoothRadius?: number) => void;
+  onDeletePoint: (pointId: string) => void;
+  onConnectPoints: (pointAId: string, pointBId: string) => void;
   onAddPoint: (lat: number, lon: number) => void;
   onAddWaypoint: (lat: number, lon: number) => void;
   onChangeEditMode: (mode: MapEditMode) => void;
@@ -43,19 +48,31 @@ const TILE_LAYERS: Record<MapLayerType, { url: string; attribution: string; maxZ
   },
 };
 
+function cosineFalloff(offset: number, radius: number): number {
+  if (radius <= 0) return offset === 0 ? 1 : 0;
+  const abs = Math.abs(offset);
+  if (abs > radius) return 0;
+  return 0.5 * (1 + Math.cos((Math.PI * abs) / (radius + 1)));
+}
+
 export const MapEditor: React.FC<MapEditorProps> = ({
   track,
   waypoints,
   selectedPointId,
   hoveredPointId,
+  focusPointRequest = null,
   trimRangeIndices = null,
   terrainElevations,
   onlyTerrain = false,
   editMode,
   mapLayer,
+  dragSmoothRadius,
+  onChangeDragSmoothRadius,
   onSelectPoint,
   onHoverPoint,
   onMovePoint,
+  onDeletePoint,
+  onConnectPoints,
   onAddPoint,
   onAddWaypoint,
   onChangeEditMode,
@@ -67,25 +84,75 @@ export const MapEditor: React.FC<MapEditorProps> = ({
   const tileLayerRef = useRef<L.TileLayer | null>(null);
   const trackLayerGroupRef = useRef<L.LayerGroup | null>(null);
   const markersLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const previewLayerGroupRef = useRef<L.LayerGroup | null>(null);
   const hoverMarkerRef = useRef<L.CircleMarker | null>(null);
-  const selectedMarkerRef = useRef<L.Marker | null>(null);
+
+  const [connectStartId, setConnectStartId] = useState<string | null>(null);
+  const [viewRevision, setViewRevision] = useState<number>(0);
+
+  // Reset connect anchor when leaving connect mode or switching tracks
+  useEffect(() => {
+    if (editMode !== 'connect') {
+      setConnectStartId(null);
+    }
+  }, [editMode, track?.id]);
+
+  // Allow Escape key to cancel current connect anchor
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && connectStartId) {
+        setConnectStartId(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [connectStartId]);
+
+  const handlePointClick = (pointId: string) => {
+    if (callbacksRef.current.editMode === 'connect') {
+      const startId = connectStartIdRef.current;
+      if (!startId) {
+        setConnectStartId(pointId);
+        callbacksRef.current.onSelectPoint(pointId);
+      } else if (startId === pointId) {
+        setConnectStartId(null);
+      } else {
+        callbacksRef.current.onConnectPoints(startId, pointId);
+        setConnectStartId(null);
+        callbacksRef.current.onSelectPoint(pointId);
+      }
+      return;
+    }
+    callbacksRef.current.onSelectPoint(pointId);
+  };
+
+  const connectStartIdRef = useRef<string | null>(null);
+  connectStartIdRef.current = connectStartId;
 
   // Keep latest callbacks in refs so Leaflet event listeners never go stale
   const callbacksRef = useRef({
     editMode,
+    dragSmoothRadius,
     onSelectPoint,
     onHoverPoint,
     onMovePoint,
+    onDeletePoint,
+    onConnectPoints,
     onAddPoint,
     onAddWaypoint,
+    handlePointClick,
   });
   callbacksRef.current = {
     editMode,
+    dragSmoothRadius,
     onSelectPoint,
     onHoverPoint,
     onMovePoint,
+    onDeletePoint,
+    onConnectPoints,
     onAddPoint,
     onAddWaypoint,
+    handlePointClick,
   };
   const lastHoveredIdRef = useRef<string | null>(null);
 
@@ -108,11 +175,20 @@ export const MapEditor: React.FC<MapEditorProps> = ({
     }).addTo(map);
 
     const trackGroup = L.layerGroup().addTo(map);
+    const previewGroup = L.layerGroup().addTo(map);
     const markersGroup = L.layerGroup().addTo(map);
 
+    map.on('moveend zoomend', () => {
+      setViewRevision((r) => r + 1);
+    });
+
     map.on('click', (e: L.LeafletMouseEvent) => {
-      const { editMode: mode, onAddPoint: addPt, onAddWaypoint: addWpt, onSelectPoint: selPt } =
-        callbacksRef.current;
+      const {
+        editMode: mode,
+        onAddPoint: addPt,
+        onAddWaypoint: addWpt,
+        handlePointClick: clickPt,
+      } = callbacksRef.current;
 
       if (mode === 'add') {
         addPt(e.latlng.lat, e.latlng.lng);
@@ -123,7 +199,7 @@ export const MapEditor: React.FC<MapEditorProps> = ({
         return;
       }
 
-      // In select mode, find nearest trackpoint within reasonable pixel threshold
+      // In select or connect mode, find nearest trackpoint within reasonable pixel threshold
       const currentTrack = trackRef.current;
       if (!currentTrack) return;
       const points = currentTrack.segments.flatMap((s) => s.points);
@@ -143,7 +219,7 @@ export const MapEditor: React.FC<MapEditorProps> = ({
       }
 
       if (closestId) {
-        selPt(closestId);
+        clickPt(closestId);
       }
     });
 
@@ -189,6 +265,7 @@ export const MapEditor: React.FC<MapEditorProps> = ({
     mapRef.current = map;
     tileLayerRef.current = tile;
     trackLayerGroupRef.current = trackGroup;
+    previewLayerGroupRef.current = previewGroup;
     markersLayerGroupRef.current = markersGroup;
 
     const resizeObserver = new ResizeObserver(() => {
@@ -222,85 +299,128 @@ export const MapEditor: React.FC<MapEditorProps> = ({
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    el.style.cursor = editMode === 'add' || editMode === 'waypoint' ? 'crosshair' : '';
+    el.style.cursor =
+      editMode === 'add' || editMode === 'waypoint' || editMode === 'connect'
+        ? 'crosshair'
+        : '';
   }, [editMode]);
 
-  // Render track polylines, start/end markers, waypoints, and vertex dots
+  // Render track polylines, gap bridges, start/end markers, waypoints, and draggable vertex handles
   useEffect(() => {
     const map = mapRef.current;
     const trackGroup = trackLayerGroupRef.current;
     const markersGroup = markersLayerGroupRef.current;
-    if (!map || !trackGroup || !markersGroup) return;
+    const previewGroup = previewLayerGroupRef.current;
+    if (!map || !trackGroup || !markersGroup || !previewGroup) return;
 
     trackGroup.clearLayers();
     markersGroup.clearLayers();
-    selectedMarkerRef.current = null;
+    previewGroup.clearLayers();
 
     if (track) {
       const allPoints: TrackPoint[] = [];
-      for (const seg of track.segments) {
-        if (seg.points.length > 0) {
-          allPoints.push(...seg.points);
-          const latlngs: L.LatLngExpression[] = seg.points.map((p) => [p.lat, p.lon]);
+      const segmentEndpointIds = new Set<string>();
+      const nonEmptySegments = track.segments.filter((s) => s.points.length > 0);
 
-          // Outer glow / casing
-          L.polyline(latlngs, {
-            color: '#0f172a',
-            weight: 7,
-            opacity: 0.5,
-          }).addTo(trackGroup);
+      for (const seg of nonEmptySegments) {
+        allPoints.push(...seg.points);
+        segmentEndpointIds.add(seg.points[0].id);
+        segmentEndpointIds.add(seg.points[seg.points.length - 1].id);
 
-          // Main track line (multi-colored by grade % when elevation data exists)
-          const getEle = (pt: TrackPoint) =>
-            terrainElevations?.[pt.id] !== undefined ? terrainElevations[pt.id] : pt.ele;
-          const hasAnyEle = seg.points.some((p) => getEle(p) !== undefined);
+        const latlngs: L.LatLngExpression[] = seg.points.map((p) => [p.lat, p.lon]);
 
-          if (hasAnyEle && seg.points.length >= 2) {
-            let activeColor: string | null = null;
-            let activePts: L.LatLngExpression[] = [];
+        // Outer glow / casing
+        L.polyline(latlngs, {
+          color: '#0f172a',
+          weight: 7,
+          opacity: 0.5,
+        }).addTo(trackGroup);
 
-            for (let i = 1; i < seg.points.length; i += 1) {
-              const prev = seg.points[i - 1];
-              const curr = seg.points[i];
-              const e1 = getEle(prev);
-              const e2 = getEle(curr);
-              let color = '#22c55e';
-              if (e1 !== undefined && e2 !== undefined) {
-                const dist = haversineDistanceM(prev.lat, prev.lon, curr.lat, curr.lon);
-                const grade = dist > 0.5 ? ((e2 - e1) / dist) * 100 : 0;
-                color = getGradeColor(grade);
-              }
-              if (color === activeColor) {
-                activePts.push([curr.lat, curr.lon]);
-              } else {
-                if (activeColor && activePts.length >= 2) {
-                  L.polyline(activePts, {
-                    color: activeColor,
-                    weight: 4,
-                    opacity: 0.95,
-                  }).addTo(trackGroup);
-                }
-                activeColor = color;
-                activePts = [
-                  [prev.lat, prev.lon],
-                  [curr.lat, curr.lon],
-                ];
-              }
+        // Main track line (multi-colored by grade % when elevation data exists)
+        const getEle = (pt: TrackPoint) =>
+          terrainElevations?.[pt.id] !== undefined ? terrainElevations[pt.id] : pt.ele;
+        const hasAnyEle = seg.points.some((p) => getEle(p) !== undefined);
+
+        if (hasAnyEle && seg.points.length >= 2) {
+          let activeColor: string | null = null;
+          let activePts: L.LatLngExpression[] = [];
+
+          for (let i = 1; i < seg.points.length; i += 1) {
+            const prev = seg.points[i - 1];
+            const curr = seg.points[i];
+            const e1 = getEle(prev);
+            const e2 = getEle(curr);
+            let color = '#22c55e';
+            if (e1 !== undefined && e2 !== undefined) {
+              const dist = haversineDistanceM(prev.lat, prev.lon, curr.lat, curr.lon);
+              const grade = dist > 0.5 ? ((e2 - e1) / dist) * 100 : 0;
+              color = getGradeColor(grade);
             }
-            if (activeColor && activePts.length >= 2) {
-              L.polyline(activePts, {
-                color: activeColor,
-                weight: 4,
-                opacity: 0.95,
-              }).addTo(trackGroup);
+            if (color === activeColor) {
+              activePts.push([curr.lat, curr.lon]);
+            } else {
+              if (activeColor && activePts.length >= 2) {
+                L.polyline(activePts, {
+                  color: activeColor,
+                  weight: 4,
+                  opacity: 0.95,
+                }).addTo(trackGroup);
+              }
+              activeColor = color;
+              activePts = [
+                [prev.lat, prev.lon],
+                [curr.lat, curr.lon],
+              ];
             }
-          } else {
-            L.polyline(latlngs, {
-              color: '#f97316',
+          }
+          if (activeColor && activePts.length >= 2) {
+            L.polyline(activePts, {
+              color: activeColor,
               weight: 4,
               opacity: 0.95,
             }).addTo(trackGroup);
           }
+        } else {
+          L.polyline(latlngs, {
+            color: '#f97316',
+            weight: 4,
+            opacity: 0.95,
+          }).addTo(trackGroup);
+        }
+      }
+
+      // Render clickable dashed gap bridges between separate segments
+      if (nonEmptySegments.length > 1) {
+        for (let s = 0; s < nonEmptySegments.length - 1; s += 1) {
+          const prevSeg = nonEmptySegments[s];
+          const nextSeg = nonEmptySegments[s + 1];
+          const endPt = prevSeg.points[prevSeg.points.length - 1];
+          const startPt = nextSeg.points[0];
+          const gapDistM = Math.round(
+            haversineDistanceM(endPt.lat, endPt.lon, startPt.lat, startPt.lon)
+          );
+
+          const gapLine = L.polyline(
+            [
+              [endPt.lat, endPt.lon],
+              [startPt.lat, startPt.lon],
+            ],
+            {
+              color: '#38bdf8',
+              weight: 4,
+              opacity: 0.9,
+              dashArray: '6 6',
+            }
+          );
+          gapLine.bindTooltip(
+            `Unconnected Gap (${gapDistM} m)<br/><b>Click to connect these two points</b>`,
+            { sticky: true, direction: 'top' }
+          );
+          gapLine.on('click', (ev) => {
+            L.DomEvent.stopPropagation(ev);
+            callbacksRef.current.onConnectPoints(endPt.id, startPt.id);
+          });
+          gapLine.addTo(trackGroup);
         }
       }
 
@@ -321,27 +441,6 @@ export const MapEditor: React.FC<MapEditorProps> = ({
         }
       }
 
-      // Render small clickable vertex dots (hidden when Only Terrain mode is active)
-      if (!onlyTerrain) {
-        const step = allPoints.length > 600 ? Math.ceil(allPoints.length / 400) : 1;
-        for (let i = 0; i < allPoints.length; i += step) {
-          const pt = allPoints[i];
-          if (pt.id === selectedPointId) continue;
-          const dot = L.circleMarker([pt.lat, pt.lon], {
-            radius: 3.5,
-            color: '#ffffff',
-            weight: 1.5,
-            fillColor: '#f97316',
-            fillOpacity: 1,
-          });
-          dot.on('click', (ev) => {
-            L.DomEvent.stopPropagation(ev);
-            callbacksRef.current.onSelectPoint(pt.id);
-          });
-          dot.addTo(markersGroup);
-        }
-      }
-
       // Start & End markers
       if (allPoints.length > 0) {
         const start = allPoints[0];
@@ -353,6 +452,7 @@ export const MapEditor: React.FC<MapEditorProps> = ({
           weight: 2,
           fillColor: '#22c55e',
           fillOpacity: 1,
+          interactive: false,
         })
           .bindTooltip('Start', { direction: 'top' })
           .addTo(markersGroup);
@@ -364,44 +464,170 @@ export const MapEditor: React.FC<MapEditorProps> = ({
             weight: 2,
             fillColor: '#ef4444',
             fillOpacity: 1,
+            interactive: false,
           })
             .bindTooltip('End', { direction: 'top' })
             .addTo(markersGroup);
         }
       }
 
-      // Selected point draggable marker
-      if (selectedPointId) {
-        const selPt = allPoints.find((p) => p.id === selectedPointId);
-        if (selPt) {
+      // Render directly-draggable & clickable vertex handles (viewport-culled for speed & density)
+      if (!onlyTerrain && allPoints.length > 0) {
+        const bounds = map.getBounds().pad(0.2);
+        const inViewIndices: number[] = [];
+        for (let i = 0; i < allPoints.length; i += 1) {
+          const p = allPoints[i];
+          if (bounds.contains([p.lat, p.lon])) {
+            inViewIndices.push(i);
+          }
+        }
+
+        const maxVisibleHandles = 400;
+        const step =
+          inViewIndices.length > maxVisibleHandles
+            ? Math.ceil(inViewIndices.length / maxVisibleHandles)
+            : 1;
+
+        const indicesToRender = new Set<number>();
+        for (let k = 0; k < inViewIndices.length; k += step) {
+          indicesToRender.add(inViewIndices[k]);
+        }
+
+        // Always render selected point, connect anchor point, and segment gap endpoints
+        for (let i = 0; i < allPoints.length; i += 1) {
+          const ptId = allPoints[i].id;
+          if (
+            ptId === selectedPointId ||
+            ptId === connectStartId ||
+            segmentEndpointIds.has(ptId)
+          ) {
+            indicesToRender.add(i);
+          }
+        }
+
+        indicesToRender.forEach((idx) => {
+          const pt = allPoints[idx];
+          const isSelected = pt.id === selectedPointId;
+          const isConnectAnchor = pt.id === connectStartId;
+          const isGapEndpoint =
+            segmentEndpointIds.has(pt.id) &&
+            idx !== 0 &&
+            idx !== allPoints.length - 1;
+
+          let size = 10;
+          let bg = '#f97316';
+          let border = '2px solid #ffffff';
+          let shadow = '0 1px 3px rgba(0,0,0,0.45)';
+          let zOffset = 100;
+
+          if (isConnectAnchor) {
+            size = 18;
+            bg = '#06b6d4';
+            border = '3px solid #ffffff';
+            shadow = '0 0 0 4px rgba(6,182,212,0.45), 0 2px 6px rgba(0,0,0,0.6)';
+            zOffset = 1200;
+          } else if (isSelected) {
+            size = 18;
+            bg = '#3b82f6';
+            border = '3px solid #ffffff';
+            shadow = '0 0 0 3px rgba(59,130,246,0.45), 0 2px 6px rgba(0,0,0,0.5)';
+            zOffset = 1000;
+          } else if (isGapEndpoint) {
+            size = 13;
+            bg = '#38bdf8';
+            border = '2px solid #ffffff';
+            shadow = '0 0 0 2px rgba(56,189,248,0.4), 0 1px 4px rgba(0,0,0,0.5)';
+            zOffset = 500;
+          }
+
+          const cursor = editMode === 'connect' ? 'pointer' : 'grab';
           const icon = L.divIcon({
-            className: 'gpx-selected-pin',
-            html: `<div style="width:18px;height:18px;border-radius:50%;background:#3b82f6;border:3px solid #ffffff;box-shadow:0 0 0 3px rgba(59,130,246,0.45),0 2px 6px rgba(0,0,0,0.5);cursor:grab;"></div>`,
-            iconSize: [18, 18],
-            iconAnchor: [9, 9],
+            className: 'gpx-vertex-handle',
+            html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:${bg};border:${border};box-shadow:${shadow};cursor:${cursor};box-sizing:border-box;"></div>`,
+            iconSize: [size, size],
+            iconAnchor: [size / 2, size / 2],
           });
 
-          const marker = L.marker([selPt.lat, selPt.lon], {
+          const marker = L.marker([pt.lat, pt.lon], {
             icon,
-            draggable: true,
-            zIndexOffset: 1000,
+            draggable: editMode !== 'connect',
+            zIndexOffset: zOffset,
+          });
+
+          marker.on('click', (ev) => {
+            L.DomEvent.stopPropagation(ev);
+            callbacksRef.current.handlePointClick(pt.id);
+          });
+
+          // Right-click on any vertex handle deletes the point immediately
+          marker.on('contextmenu', (ev) => {
+            L.DomEvent.stopPropagation(ev);
+            callbacksRef.current.onDeletePoint(pt.id);
+          });
+
+          marker.on('drag', () => {
+            const pos = marker.getLatLng();
+            const radius = callbacksRef.current.dragSmoothRadius;
+            const dLat = pos.lat - pt.lat;
+            const dLon = pos.lng - pt.lon;
+
+            previewGroup.clearLayers();
+            const lo = Math.max(0, idx - radius - 1);
+            const hi = Math.min(allPoints.length - 1, idx + radius + 1);
+            const previewCoords: L.LatLngExpression[] = [];
+
+            for (let k = lo; k <= hi; k += 1) {
+              const p = allPoints[k];
+              const w = cosineFalloff(k - idx, radius);
+              if (k === idx) {
+                previewCoords.push([pos.lat, pos.lng]);
+              } else if (w > 0) {
+                previewCoords.push([p.lat + dLat * w, p.lon + dLon * w]);
+              } else {
+                previewCoords.push([p.lat, p.lon]);
+              }
+            }
+
+            if (previewCoords.length >= 2) {
+              L.polyline(previewCoords, {
+                color: '#38bdf8',
+                weight: 4,
+                opacity: 0.95,
+                dashArray: '6 4',
+              }).addTo(previewGroup);
+            }
           });
 
           marker.on('dragend', () => {
+            previewGroup.clearLayers();
             const pos = marker.getLatLng();
-            callbacksRef.current.onMovePoint(selPt.id, pos.lat, pos.lng);
+            callbacksRef.current.onSelectPoint(pt.id);
+            callbacksRef.current.onMovePoint(
+              pt.id,
+              pos.lat,
+              pos.lng,
+              callbacksRef.current.dragSmoothRadius
+            );
           });
 
-          marker.bindTooltip(
-            `Selected Point<br/>${selPt.lat.toFixed(5)}, ${selPt.lon.toFixed(5)}${
-              selPt.ele !== undefined ? `<br/>Ele: ${selPt.ele.toFixed(1)} m` : ''
-            }<br/><i>Drag to move</i>`,
-            { direction: 'top', offset: [0, -8] }
-          );
+          const tooltipText =
+            editMode === 'connect'
+              ? connectStartId
+                ? `Point #${idx + 1}<br/><b>Click to connect Point A → here</b>`
+                : `Point #${idx + 1}<br/><b>Click to set as Point A</b>`
+              : `Point #${idx + 1}${isGapEndpoint ? ' (Gap Endpoint)' : ''}<br/>${pt.lat.toFixed(
+                  5
+                )}, ${pt.lon.toFixed(5)}${
+                  pt.ele !== undefined ? `<br/>Ele: ${pt.ele.toFixed(1)} m` : ''
+                }<br/><i>Drag to move • Right-click to delete</i>`;
+
+          marker.bindTooltip(tooltipText, {
+            direction: 'top',
+            offset: [0, -6],
+          });
 
           marker.addTo(markersGroup);
-          selectedMarkerRef.current = marker;
-        }
+        });
       }
     }
 
@@ -417,11 +643,22 @@ export const MapEditor: React.FC<MapEditorProps> = ({
         .bindTooltip(wpt.name || 'Waypoint', { direction: 'top' })
         .addTo(markersGroup);
     }
-  }, [track, waypoints, selectedPointId, terrainElevations, onlyTerrain, trimRangeIndices]);
+  }, [
+    track,
+    waypoints,
+    selectedPointId,
+    connectStartId,
+    editMode,
+    terrainElevations,
+    onlyTerrain,
+    trimRangeIndices,
+    viewRevision,
+  ]);
 
-  // Hover point indicator (synced from chart or table)
+  // Hover point indicator & live Connect A -> B preview line
   useEffect(() => {
     const map = mapRef.current;
+    const previewGroup = previewLayerGroupRef.current;
     if (!map) return;
 
     if (hoverMarkerRef.current) {
@@ -429,19 +666,62 @@ export const MapEditor: React.FC<MapEditorProps> = ({
       hoverMarkerRef.current = null;
     }
 
+    if (previewGroup && editMode === 'connect') {
+      previewGroup.clearLayers();
+    }
+
     if (!hoveredPointId || !track) return;
-    const pt = track.segments.flatMap((s) => s.points).find((p) => p.id === hoveredPointId);
-    if (!pt) return;
+    const allPts = track.segments.flatMap((s) => s.points);
+    const hoverIdx = allPts.findIndex((p) => p.id === hoveredPointId);
+    if (hoverIdx === -1) return;
+    const pt = allPts[hoverIdx];
 
     hoverMarkerRef.current = L.circleMarker([pt.lat, pt.lon], {
       radius: 7,
       color: '#ffffff',
       weight: 2,
-      fillColor: '#eab308',
+      fillColor: editMode === 'connect' ? '#06b6d4' : '#eab308',
       fillOpacity: 1,
       interactive: false,
     }).addTo(map);
-  }, [hoveredPointId, track]);
+
+    // In Connect mode with Point A chosen, show live preview line A -> hovered B
+    // and highlight the noisy intermediate points that will be removed
+    if (editMode === 'connect' && connectStartId && previewGroup && connectStartId !== pt.id) {
+      const startIdx = allPts.findIndex((p) => p.id === connectStartId);
+      if (startIdx !== -1) {
+        const startPt = allPts[startIdx];
+        const lo = Math.min(startIdx, hoverIdx);
+        const hi = Math.max(startIdx, hoverIdx);
+
+        if (hi - lo > 1) {
+          const removedSlice = allPts.slice(lo, hi + 1);
+          L.polyline(
+            removedSlice.map((p) => [p.lat, p.lon] as L.LatLngExpression),
+            {
+              color: '#ef4444',
+              weight: 5,
+              opacity: 0.75,
+              dashArray: '5 6',
+            }
+          ).addTo(previewGroup);
+        }
+
+        L.polyline(
+          [
+            [startPt.lat, startPt.lon],
+            [pt.lat, pt.lon],
+          ],
+          {
+            color: '#06b6d4',
+            weight: 5,
+            opacity: 0.95,
+            dashArray: '8 5',
+          }
+        ).addTo(previewGroup);
+      }
+    }
+  }, [hoveredPointId, track, editMode, connectStartId]);
 
   // Fit bounds when fitTrigger increments
   const handleFitBounds = () => {
@@ -459,6 +739,23 @@ export const MapEditor: React.FC<MapEditorProps> = ({
     }
   }, [fitTrigger]);
 
+  // Zoom & center map on requested focus point (e.g. from spike list or Jump to Max Speed)
+  useEffect(() => {
+    if (!focusPointRequest || !track) return;
+    const map = mapRef.current;
+    if (!map) return;
+    const pt = track.segments.flatMap((s) => s.points).find((p) => p.id === focusPointRequest.pointId);
+    if (!pt) return;
+    const maxZoom = TILE_LAYERS[mapLayer]?.maxZoom ?? 18;
+    const targetZoom = Math.min(maxZoom, Math.max(map.getZoom(), 17));
+    map.setView([pt.lat, pt.lon], targetZoom, { animate: true });
+  }, [focusPointRequest?.seq]);
+
+  const connectStartIndex =
+    connectStartId && track
+      ? track.segments.flatMap((s) => s.points).findIndex((p) => p.id === connectStartId)
+      : -1;
+
   return (
     <div className="map-wrapper">
       <div ref={containerRef} className="leaflet-container-box" />
@@ -469,10 +766,18 @@ export const MapEditor: React.FC<MapEditorProps> = ({
           <button
             className={`map-btn ${editMode === 'select' ? 'active' : ''}`}
             onClick={() => onChangeEditMode('select')}
-            title="Select & Move Points (click track to select, drag blue pin to move)"
+            title="Select & Drag Any Trackpoint (drag dots directly to fix GPS jumps, right-click a dot to delete)"
           >
             <MousePointer size={15} />
-            <span>Select / Move</span>
+            <span>Select / Drag</span>
+          </button>
+          <button
+            className={`map-btn ${editMode === 'connect' ? 'active' : ''}`}
+            onClick={() => onChangeEditMode('connect')}
+            title="Connect Two Points (click 1st clean point, then click 2nd clean point to bridge gaps or remove noisy detours)"
+          >
+            <Link2 size={15} />
+            <span>Connect Points</span>
           </button>
           <button
             className={`map-btn ${editMode === 'add' ? 'active' : ''}`}
@@ -491,6 +796,26 @@ export const MapEditor: React.FC<MapEditorProps> = ({
             <span>Add Waypoint</span>
           </button>
         </div>
+
+        {editMode === 'select' && (
+          <div className="map-control-group" title="When dragging a point, smoothly pull neighboring points along with it">
+            <span style={{ fontSize: 11, color: '#94a3b8', padding: '0 6px', alignSelf: 'center' }}>
+              Drag Pull:
+            </span>
+            <select
+              className="map-select"
+              value={dragSmoothRadius}
+              onChange={(e) => onChangeDragSmoothRadius(Number(e.target.value))}
+              aria-label="Drag neighbor pull radius"
+            >
+              <option value={0}>Single Point</option>
+              <option value={2}>Smooth ±2 pts</option>
+              <option value={5}>Smooth ±5 pts</option>
+              <option value={10}>Smooth ±10 pts</option>
+              <option value={20}>Smooth ±20 pts</option>
+            </select>
+          </div>
+        )}
 
         <div className="map-control-group">
           <select
@@ -525,12 +850,42 @@ export const MapEditor: React.FC<MapEditorProps> = ({
       </div>
 
       {editMode !== 'select' && (
-        <div className="map-mode-banner">
-          {editMode === 'add'
-            ? selectedPointId
-              ? 'Click anywhere on the map to insert a new trackpoint after the selected point'
-              : 'Click anywhere on the map to append a new trackpoint'
-            : 'Click anywhere on the map to place a new waypoint'}
+        <div
+          className="map-mode-banner"
+          style={
+            editMode === 'connect'
+              ? { borderColor: '#06b6d4', pointerEvents: 'auto', display: 'flex', alignItems: 'center', gap: 10 }
+              : undefined
+          }
+        >
+          {editMode === 'connect' ? (
+            connectStartId ? (
+              <>
+                <span>
+                  <strong style={{ color: '#22d3ee' }}>Point A (#{connectStartIndex + 1})</strong> selected — now click the 2nd clean point (<strong>Point B</strong>) to connect them directly
+                </span>
+                <button
+                  className="btn-secondary-sm"
+                  style={{ padding: '2px 8px', fontSize: 11 }}
+                  onClick={() => setConnectStartId(null)}
+                >
+                  Reset A
+                </button>
+              </>
+            ) : (
+              <span>
+                <strong>Connect Mode:</strong> Click the 1st clean trackpoint (<strong>Point A</strong>) before the GPS jump or gap
+              </span>
+            )
+          ) : editMode === 'add' ? (
+            selectedPointId ? (
+              'Click anywhere on the map to insert a new trackpoint after the selected point'
+            ) : (
+              'Click anywhere on the map to append a new trackpoint'
+            )
+          ) : (
+            'Click anywhere on the map to place a new waypoint'
+          )}
         </div>
       )}
 
@@ -544,4 +899,3 @@ export const MapEditor: React.FC<MapEditorProps> = ({
     </div>
   );
 };
-

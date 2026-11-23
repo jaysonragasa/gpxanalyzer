@@ -1,11 +1,14 @@
 import React, { useEffect, useState } from 'react';
 import {
+  AlertTriangle,
   ArrowLeftRight,
   CalendarClock,
   ChevronLeft,
   ChevronRight,
+  Copy,
   ExternalLink,
   Gauge,
+  Link2,
   MapPin,
   Plus,
   Scissors,
@@ -25,6 +28,7 @@ import {
   formatDistance,
   formatDuration,
   getGoogleStreetViewUrl,
+  SpeedSpikeAnomaly,
   TimestampHealth,
   toLocalDateTimeInputValue,
 } from '../utils/gpxParser';
@@ -37,6 +41,7 @@ interface SidebarProps {
   selectedPointId: string | null;
   onSelectTrack: (trackId: string) => void;
   onSelectPoint: (pointId: string) => void;
+  onFocusPoint: (pointId: string, metric?: 'elevation' | 'speed') => void;
   onHoverPoint: (pointId: string | null) => void;
   onUpdatePoint: (pointId: string, patch: Partial<TrackPoint>) => void;
   onDeletePoint: (pointId: string) => void;
@@ -47,10 +52,18 @@ interface SidebarProps {
   onSetTrimRangeStart: (pointId: string | null) => void;
   onSetTrimRangeEnd: (pointId: string | null) => void;
   onCutRange: (startId: string, endId: string) => void;
+  onConnectRange: (startId: string, endId: string) => void;
+  onJoinSegments: () => void;
   onKeepOnlyRange: (startId: string, endId: string) => void;
   onReverseTrack: () => void;
   onSmoothPoint: (pointId: string) => void;
   onFixSpeedSpikes: (maxSpeedKmh: number, mode: 'interpolate' | 'remove') => void;
+  onApplyPointSpeeds: (speedTargets: Record<string, number>, label?: string) => void;
+  detectedSpikes: SpeedSpikeAnomaly[];
+  spikeJumpThresholdKmh: number;
+  spikeMaxCapKmh: number;
+  onChangeSpikeJumpThreshold: (val: number) => void;
+  onChangeSpikeMaxCap: (val: number) => void;
   onJumpToMaxSpeed: () => void;
   onRepairTimestamps: () => void;
   onUpdateMetadata: (metaPatch: Partial<GpxDocument['metadata']>, trackPatch?: Partial<GpxTrack>) => void;
@@ -76,6 +89,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   selectedPointId,
   onSelectTrack,
   onSelectPoint,
+  onFocusPoint,
   onHoverPoint,
   onUpdatePoint,
   onDeletePoint,
@@ -86,10 +100,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onSetTrimRangeStart,
   onSetTrimRangeEnd,
   onCutRange,
+  onConnectRange,
+  onJoinSegments,
   onKeepOnlyRange,
   onReverseTrack,
   onSmoothPoint,
   onFixSpeedSpikes,
+  onApplyPointSpeeds,
+  detectedSpikes,
+  spikeJumpThresholdKmh,
+  spikeMaxCapKmh,
+  onChangeSpikeJumpThreshold,
+  onChangeSpikeMaxCap,
   onJumpToMaxSpeed,
   onRepairTimestamps,
   onUpdateMetadata,
@@ -107,13 +129,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [startDateInput, setStartDateInput] = useState('');
   const [fallbackSpeed, setFallbackSpeed] = useState(12);
   const [customShiftMin, setCustomShiftMin] = useState(60);
-  const [spikeThresholdKmh, setSpikeThresholdKmh] = useState(45);
 
   useEffect(() => {
     setStartDateInput(toLocalDateTimeInputValue(stats.startTime));
   }, [stats.startTime]);
 
   const selectedStat = stats.pointStats.find((ps) => ps.point.id === selectedPointId);
+  const selectedSpike = detectedSpikes.find((sp) => sp.pointId === selectedPointId);
+  const prevNeighborStat =
+    selectedStat && selectedStat.index > 1 ? stats.pointStats[selectedStat.index - 1] : undefined;
+  const nextNeighborStat =
+    selectedStat && selectedStat.index < stats.pointStats.length - 1
+      ? stats.pointStats[selectedStat.index + 1]
+      : undefined;
 
   // Auto-jump page when a point is selected on the map/chart
   useEffect(() => {
@@ -295,6 +323,108 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       <input type="text" readOnly value={`${selectedStat.speedKmh.toFixed(1)} km/h`} />
                     </label>
                   </div>
+
+                  {/* Nearest Neighbor Speed Comparison & One-Click Copy */}
+                  {selectedStat.index > 0 && (prevNeighborStat || nextNeighborStat || selectedSpike) && (
+                    <div
+                      className="info-box"
+                      style={
+                        selectedSpike
+                          ? { borderColor: 'rgba(248, 113, 113, 0.55)', background: 'rgba(239, 68, 68, 0.08)' }
+                          : undefined
+                      }
+                    >
+                      {selectedSpike && (
+                        <div style={{ color: '#fca5a5', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 5 }}>
+                          <AlertTriangle size={13} />
+                          <span>
+                            Detected Spike (+{selectedSpike.jumpKmh.toFixed(1)} km/h above nearest)
+                          </span>
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
+                        <span>
+                          Prev:{' '}
+                          <strong style={{ color: '#93c5fd' }}>
+                            {selectedSpike?.prevSpeedKmh !== undefined && selectedSpike?.prevSpeedKmh !== null
+                              ? `${selectedSpike.prevSpeedKmh.toFixed(1)} km/h`
+                              : prevNeighborStat
+                              ? `${prevNeighborStat.speedKmh.toFixed(1)} km/h`
+                              : '—'}
+                          </strong>
+                        </span>
+                        <span>
+                          Next:{' '}
+                          <strong style={{ color: '#93c5fd' }}>
+                            {selectedSpike?.nextSpeedKmh !== undefined && selectedSpike?.nextSpeedKmh !== null
+                              ? `${selectedSpike.nextSpeedKmh.toFixed(1)} km/h`
+                              : nextNeighborStat
+                              ? `${nextNeighborStat.speedKmh.toFixed(1)} km/h`
+                              : '—'}
+                          </strong>
+                        </span>
+                      </div>
+                      <div className="action-row" style={{ marginTop: 2 }}>
+                        {(selectedSpike?.prevSpeedKmh ?? prevNeighborStat?.speedKmh) !== undefined && (
+                          <button
+                            className="btn-secondary-sm"
+                            onClick={() => {
+                              const target =
+                                selectedSpike?.prevSpeedKmh ?? prevNeighborStat!.speedKmh;
+                              onApplyPointSpeeds(
+                                { [selectedStat.point.id]: target },
+                                `Copied previous point speed (${target.toFixed(1)} km/h)`
+                              );
+                            }}
+                            title="Match this point's speed to the nearest previous clean point"
+                          >
+                            <Copy size={12} /> Copy Prev (
+                            {(selectedSpike?.prevSpeedKmh ?? prevNeighborStat!.speedKmh).toFixed(1)})
+                          </button>
+                        )}
+                        {(selectedSpike?.nextSpeedKmh ?? nextNeighborStat?.speedKmh) !== undefined && (
+                          <button
+                            className="btn-secondary-sm"
+                            onClick={() => {
+                              const target =
+                                selectedSpike?.nextSpeedKmh ?? nextNeighborStat!.speedKmh;
+                              onApplyPointSpeeds(
+                                { [selectedStat.point.id]: target },
+                                `Copied next point speed (${target.toFixed(1)} km/h)`
+                              );
+                            }}
+                            title="Match this point's speed to the nearest next clean point"
+                          >
+                            <Copy size={12} /> Copy Next (
+                            {(selectedSpike?.nextSpeedKmh ?? nextNeighborStat!.speedKmh).toFixed(1)})
+                          </button>
+                        )}
+                        {(selectedSpike || (prevNeighborStat && nextNeighborStat)) && (
+                          <button
+                            className="btn-secondary-sm"
+                            style={{ borderColor: '#22c55e', color: '#86efac' }}
+                            onClick={() => {
+                              const avg = selectedSpike
+                                ? selectedSpike.avgNeighborSpeedKmh
+                                : (prevNeighborStat!.speedKmh + nextNeighborStat!.speedKmh) / 2;
+                              onApplyPointSpeeds(
+                                { [selectedStat.point.id]: avg },
+                                `Matched nearest neighbor average speed (${avg.toFixed(1)} km/h)`
+                              );
+                            }}
+                            title="Match this point's speed to the average of its nearest clean neighbors"
+                          >
+                            <Sparkles size={12} /> Copy Nearest Avg (
+                            {(selectedSpike
+                              ? selectedSpike.avgNeighborSpeedKmh
+                              : (prevNeighborStat!.speedKmh + nextNeighborStat!.speedKmh) / 2
+                            ).toFixed(1)}
+                            )
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
                   <label className="field">
                     <span>Timestamp (Local)</span>
                     <input
@@ -385,10 +515,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
               )}
             </div>
 
-            {/* Trim / Cut Portion */}
+            {/* Trim / Cut / Connect Portion */}
             <div className="panel-section">
               <div className="points-header">
-                <span className="section-title">Trim / Cut Portion</span>
+                <span className="section-title">Connect / Cut Portion</span>
                 {(trimRangeStartId || trimRangeEndId) && (
                   <button
                     className="btn-secondary-sm"
@@ -421,6 +551,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </div>
               <div className="action-row">
                 <button
+                  className="btn-secondary-sm"
+                  style={
+                    trimRangeStartId && trimRangeEndId
+                      ? { borderColor: '#06b6d4', color: '#22d3ee' }
+                      : undefined
+                  }
+                  disabled={!trimRangeStartId || !trimRangeEndId}
+                  onClick={() =>
+                    trimRangeStartId &&
+                    trimRangeEndId &&
+                    onConnectRange(trimRangeStartId, trimRangeEndId)
+                  }
+                  title="Keep clean Point A and Point B, remove any jumping points between them, and connect A directly to B without a gap"
+                >
+                  <Link2 size={13} /> Connect (A→B)
+                </button>
+                <button
                   className="btn-danger-sm"
                   disabled={!trimRangeStartId || !trimRangeEndId}
                   onClick={() =>
@@ -428,7 +575,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     trimRangeEndId &&
                     onCutRange(trimRangeStartId, trimRangeEndId)
                   }
-                  title="Cut out points between A and B"
+                  title="Cut out points A through B"
                 >
                   <Scissors size={13} /> Cut Portion (A→B)
                 </button>
@@ -445,44 +592,206 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   <Scissors size={13} /> Keep Only (A→B)
                 </button>
               </div>
+              {activeTrack && activeTrack.segments.filter((s) => s.points.length > 0).length > 1 && (
+                <button
+                  className="btn-secondary-full"
+                  style={{ borderColor: '#38bdf8', color: '#7dd3fc', marginTop: 2 }}
+                  onClick={onJoinSegments}
+                  title="Stitch all separate track segments together to close any empty gaps"
+                >
+                  <Link2 size={14} />
+                  <span>
+                    Connect All Segment Gaps (
+                    {activeTrack.segments.filter((s) => s.points.length > 0).length - 1})
+                  </span>
+                </button>
+              )}
             </div>
 
-            {/* Track-wide Tools */}
+            {/* Track-wide & Speed Spike Analyzer Tools */}
             <div className="panel-section">
-              <div className="section-title">Track &amp; Speed Spike Tools</div>
+              <div className="points-header">
+                <span className="section-title">Speed Spike Analyzer</span>
+                <span
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: detectedSpikes.length > 0 ? '#fca5a5' : '#4ade80',
+                  }}
+                >
+                  {detectedSpikes.length} spike{detectedSpikes.length === 1 ? '' : 's'}
+                </span>
+              </div>
+
+              <div className="form-grid-2">
+                <label className="field" title="Flag points jumping by at least this many km/h above their nearest surrounding points">
+                  <span>Jump vs Nearest (+km/h)</span>
+                  <input
+                    type="number"
+                    min="2"
+                    max="150"
+                    step="1"
+                    value={spikeJumpThresholdKmh}
+                    onChange={(e) =>
+                      onChangeSpikeJumpThreshold(Math.max(2, parseFloat(e.target.value) || 10))
+                    }
+                  />
+                </label>
+                <label className="field" title="Also flag any point exceeding this absolute speed cap">
+                  <span>Max Speed Cap (km/h)</span>
+                  <input
+                    type="number"
+                    min="5"
+                    max="250"
+                    step="1"
+                    value={spikeMaxCapKmh}
+                    onChange={(e) => {
+                      const v = Math.max(5, parseFloat(e.target.value) || 45);
+                      onChangeSpikeMaxCap(v);
+                    }}
+                  />
+                </label>
+              </div>
+
+              {detectedSpikes.length > 0 ? (
+                <>
+                  <div className="action-row">
+                    <button
+                      className="btn-primary-full"
+                      style={{ background: '#0ea5e9' }}
+                      onClick={() => {
+                        const targets: Record<string, number> = {};
+                        for (const sp of detectedSpikes) {
+                          targets[sp.pointId] = sp.avgNeighborSpeedKmh;
+                        }
+                        onApplyPointSpeeds(
+                          targets,
+                          `Matched all ${detectedSpikes.length} speed spikes to nearest neighbor speeds`
+                        );
+                      }}
+                      title="Set all detected spike points to match the interpolated speed of their nearest clean neighbors"
+                    >
+                      <Copy size={14} />
+                      <span>Copy Nearest Speed to All ({detectedSpikes.length})</span>
+                    </button>
+                  </div>
+
+                  <div className="action-row">
+                    <button
+                      className="btn-secondary-sm"
+                      onClick={() => {
+                        const targets: Record<string, number> = {};
+                        for (const sp of detectedSpikes) {
+                          targets[sp.pointId] = sp.prevSpeedKmh ?? sp.nearestSpeedKmh;
+                        }
+                        onApplyPointSpeeds(
+                          targets,
+                          `Copied previous neighbor speed to ${detectedSpikes.length} spikes`
+                        );
+                      }}
+                      title="Copy each spike's nearest previous clean neighbor speed"
+                    >
+                      <Copy size={12} /> All Copy Prev
+                    </button>
+                    <button
+                      className="btn-secondary-sm"
+                      onClick={() => {
+                        const targets: Record<string, number> = {};
+                        for (const sp of detectedSpikes) {
+                          targets[sp.pointId] = sp.nextSpeedKmh ?? sp.nearestSpeedKmh;
+                        }
+                        onApplyPointSpeeds(
+                          targets,
+                          `Copied next neighbor speed to ${detectedSpikes.length} spikes`
+                        );
+                      }}
+                      title="Copy each spike's nearest next clean neighbor speed"
+                    >
+                      <Copy size={12} /> All Copy Next
+                    </button>
+                    <button
+                      className="btn-secondary-sm"
+                      onClick={() => onFixSpeedSpikes(spikeMaxCapKmh, 'interpolate')}
+                      title="Smooth coordinates & timestamps for points exceeding max cap"
+                    >
+                      <Sparkles size={12} /> Smooth Coords
+                    </button>
+                    <button
+                      className="btn-danger-sm"
+                      onClick={() => onFixSpeedSpikes(spikeMaxCapKmh, 'remove')}
+                      title="Delete points exceeding max cap"
+                    >
+                      <Trash2 size={12} /> Remove
+                    </button>
+                  </div>
+
+                  <div
+                    className="points-table-wrap"
+                    style={{ maxHeight: 210 }}
+                  >
+                    <table className="points-table">
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>Spike</th>
+                          <th>Nearest Clean</th>
+                          <th style={{ textAlign: 'right' }}>Fix</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {detectedSpikes.map((sp) => {
+                          const isSel = sp.pointId === selectedPointId;
+                          return (
+                            <tr
+                              key={sp.pointId}
+                              className={isSel ? 'selected' : ''}
+                              onClick={() => onFocusPoint(sp.pointId, 'speed')}
+                              onMouseEnter={() => onHoverPoint(sp.pointId)}
+                              onMouseLeave={() => onHoverPoint(null)}
+                              title={`Click to zoom Map & Speed Graph to Point #${sp.index + 1} (${formatDistance(
+                                sp.cumulativeDistanceM
+                              )})`}
+                            >
+                              <td>#{sp.index + 1}</td>
+                              <td style={{ color: '#f87171', fontWeight: 700 }}>
+                                {sp.speedKmh.toFixed(1)}
+                              </td>
+                              <td style={{ color: '#4ade80' }} title={`Prev: ${sp.prevSpeedKmh?.toFixed(1) ?? '—'} km/h • Next: ${sp.nextSpeedKmh?.toFixed(1) ?? '—'} km/h`}>
+                                {sp.avgNeighborSpeedKmh.toFixed(1)} km/h
+                              </td>
+                              <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                <button
+                                  className="btn-secondary-sm"
+                                  style={{ padding: '2px 6px', fontSize: 10.5, borderColor: '#0ea5e9', color: '#7dd3fc' }}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    onApplyPointSpeeds(
+                                      { [sp.pointId]: sp.avgNeighborSpeedKmh },
+                                      `Point #${sp.index + 1} matched to nearest speed (${sp.avgNeighborSpeedKmh.toFixed(1)} km/h)`
+                                    );
+                                  }}
+                                  title={`Set Point #${sp.index + 1} speed to ${sp.avgNeighborSpeedKmh.toFixed(1)} km/h`}
+                                >
+                                  Copy Nearest
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              ) : (
+                <div className="info-box" style={{ color: '#86efac', borderColor: 'rgba(34,197,94,0.3)' }}>
+                  No speed spikes detected (+{spikeJumpThresholdKmh} km/h jump or &gt;{spikeMaxCapKmh} km/h). Lower the thresholds above to catch smaller fluctuations.
+                </div>
+              )}
+
               <button className="btn-secondary-full" onClick={onJumpToMaxSpeed}>
                 <Gauge size={15} />
                 <span>Jump to Max Speed Point ({stats.maxSpeedKmh.toFixed(1)} km/h)</span>
               </button>
-
-              <div className="spike-tool-box">
-                <label className="field">
-                  <span>Fix Speed Spikes Above (km/h)</span>
-                  <div className="custom-shift-row">
-                    <input
-                      type="number"
-                      min="1"
-                      max="250"
-                      value={spikeThresholdKmh}
-                      onChange={(e) => setSpikeThresholdKmh(parseFloat(e.target.value) || 45)}
-                    />
-                    <button
-                      className="btn-secondary-sm"
-                      onClick={() => onFixSpeedSpikes(spikeThresholdKmh, 'interpolate')}
-                      title="Interpolate spike points smoothly between neighbors"
-                    >
-                      <Sparkles size={13} /> Smooth
-                    </button>
-                    <button
-                      className="btn-danger-sm"
-                      onClick={() => onFixSpeedSpikes(spikeThresholdKmh, 'remove')}
-                      title="Delete spike points"
-                    >
-                      <Trash2 size={13} /> Remove
-                    </button>
-                  </div>
-                </label>
-              </div>
 
               <button className="btn-secondary-full" onClick={onReverseTrack}>
                 <ArrowLeftRight size={15} />

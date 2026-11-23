@@ -76,6 +76,6 @@ export interface TrackStats {
   pointStats: ComputedPointStats[];
 }
 
-export type MapEditMode = 'select' | 'add' | 'waypoint';
+export type MapEditMode = 'select' | 'connect' | 'add' | 'waypoint';
 export type MapLayerType = 'osm' | 'topo' | 'satellite';
 

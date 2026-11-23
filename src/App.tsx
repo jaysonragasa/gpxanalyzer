@@ -1,4 +1,4 @@
-import React, { lazy, Suspense, useCallback, useMemo, useRef, useState } from 'react';
+import React, { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   Box,
@@ -22,11 +22,16 @@ import {
   adjustTrackElevation,
   adjustTrackSpeed,
   analyzeTimestampHealth,
+  applyTargetSpeedsToPoints,
   computeTrackStats,
+  connectTrackPoints,
   createSampleGpx,
+  detectSpeedSpikes,
   fixSpeedSpikes,
   haversineDistanceM,
+  joinTrackSegments,
   mergeGpxDocuments,
+  moveTrackPointWithRadius,
   nextId,
   parseGpx,
   repairTrackTimestamps,
@@ -62,9 +67,17 @@ export function App() {
   const [activeTrackId, setActiveTrackId] = useState<string | null>(null);
   const [selectedPointId, setSelectedPointId] = useState<string | null>(null);
   const [hoveredPointId, setHoveredPointId] = useState<string | null>(null);
+  const [focusPointRequest, setFocusPointRequest] = useState<{
+    pointId: string;
+    metric?: 'elevation' | 'speed';
+    seq: number;
+  } | null>(null);
   const [trimRangeStartId, setTrimRangeStartId] = useState<string | null>(null);
   const [trimRangeEndId, setTrimRangeEndId] = useState<string | null>(null);
   const [editMode, setEditMode] = useState<MapEditMode>('select');
+  const [dragSmoothRadius, setDragSmoothRadius] = useState<number>(0);
+  const [spikeJumpThresholdKmh, setSpikeJumpThresholdKmh] = useState<number>(10);
+  const [spikeMaxCapKmh, setSpikeMaxCapKmh] = useState<number>(45);
   const [mapLayer, setMapLayer] = useState<MapLayerType>('osm');
   const [fitTrigger, setFitTrigger] = useState<number>(1);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -123,6 +136,10 @@ export function App() {
   );
 
   const stats = useMemo(() => computeTrackStats(activeTrack), [activeTrack]);
+  const detectedSpikes = useMemo(
+    () => detectSpeedSpikes(stats.pointStats, spikeJumpThresholdKmh, spikeMaxCapKmh),
+    [stats.pointStats, spikeJumpThresholdKmh, spikeMaxCapKmh]
+  );
   const timestampHealth = useMemo(() => analyzeTimestampHealth(activeTrack), [activeTrack]);
 
   const showToast = useCallback((msg: string) => {
@@ -338,19 +355,17 @@ export function App() {
 
   // Point editing handlers
   const handleMovePoint = useCallback(
-    (pointId: string, lat: number, lon: number) => {
-      commitDoc((prev) => ({
-        ...prev,
-        tracks: prev.tracks.map((trk) => ({
-          ...trk,
-          segments: trk.segments.map((seg) => ({
-            ...seg,
-            points: seg.points.map((pt) => (pt.id === pointId ? { ...pt, lat, lon } : pt)),
-          })),
-        })),
-      }));
+    (pointId: string, lat: number, lon: number, smoothRadius = 0) => {
+      const targetId = activeTrack?.id || doc.tracks[0]?.id;
+      if (!targetId) return;
+      commitDoc((prev) =>
+        moveTrackPointWithRadius(prev, targetId, pointId, lat, lon, smoothRadius)
+      );
+      if (smoothRadius > 0) {
+        showToast(`Moved point & smoothed ±${smoothRadius} neighbors`);
+      }
     },
-    [commitDoc]
+    [activeTrack?.id, doc.tracks, commitDoc, showToast]
   );
 
   const handleUpdatePoint = useCallback(
@@ -371,6 +386,15 @@ export function App() {
 
   const handleDeletePoint = useCallback(
     (pointId: string) => {
+      // Find next or previous neighbor so selection stays active for rapid deletions
+      let nextSelected: string | null = null;
+      if (selectedPointId === pointId && activeTrack) {
+        const allPts = activeTrack.segments.flatMap((s) => s.points);
+        const idx = allPts.findIndex((p) => p.id === pointId);
+        if (idx !== -1) {
+          nextSelected = allPts[idx + 1]?.id || allPts[idx - 1]?.id || null;
+        }
+      }
       commitDoc((prev) => ({
         ...prev,
         tracks: prev.tracks.map((trk) => ({
@@ -381,10 +405,25 @@ export function App() {
           })),
         })),
       }));
-      if (selectedPointId === pointId) setSelectedPointId(null);
+      if (selectedPointId === pointId) setSelectedPointId(nextSelected);
     },
-    [commitDoc, selectedPointId]
+    [activeTrack, commitDoc, selectedPointId]
   );
+
+  // Allow Delete / Backspace key to delete selected point when not typing in an input
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!selectedPointId || viewMode !== 'editor') return;
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+      const el = document.activeElement;
+      const tag = el?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+      e.preventDefault();
+      handleDeletePoint(selectedPointId);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selectedPointId, viewMode, handleDeletePoint]);
 
   const handleAddPoint = useCallback(
     (lat: number, lon: number) => {
@@ -587,6 +626,45 @@ export function App() {
     [activeTrack, commitDoc, showToast]
   );
 
+  const handleConnectPoints = useCallback(
+    (pointAId: string, pointBId: string) => {
+      if (!activeTrack) return;
+      let removed = 0;
+      let bridged = false;
+      commitDoc((prev) => {
+        const res = connectTrackPoints(prev, activeTrack.id, pointAId, pointBId, 0);
+        removed = res.removedCount;
+        bridged = res.bridgedGap;
+        return res.doc;
+      });
+      setTrimRangeStartId(null);
+      setTrimRangeEndId(null);
+      if (removed > 0 && bridged) {
+        showToast(`Connected points across gap & removed ${removed} jumping point${removed > 1 ? 's' : ''}`);
+      } else if (removed > 0) {
+        showToast(`Connected points & removed ${removed} jumping point${removed > 1 ? 's' : ''}`);
+      } else if (bridged) {
+        showToast('Connected points & closed segment gap');
+      } else {
+        showToast('Points are already adjacent and connected');
+      }
+    },
+    [activeTrack, commitDoc, showToast]
+  );
+
+  const handleJoinSegments = useCallback(() => {
+    if (!activeTrack) return;
+    let joined = 0;
+    commitDoc((prev) => {
+      const res = joinTrackSegments(prev, activeTrack.id);
+      joined = res.joinedGaps;
+      return res.doc;
+    });
+    if (joined > 0) {
+      showToast(`Connected ${joined} segment gap${joined > 1 ? 's' : ''}`);
+    }
+  }, [activeTrack, commitDoc, showToast]);
+
   const handleKeepOnlyRange = useCallback(
     (startId: string, endId: string) => {
       if (!activeTrack) return;
@@ -666,15 +744,43 @@ export function App() {
     [activeTrack, commitDoc, showToast]
   );
 
+  const handleApplyPointSpeeds = useCallback(
+    (speedTargets: Record<string, number>, label?: string) => {
+      if (!activeTrack) return;
+      let count = 0;
+      commitDoc((prev) => {
+        const res = applyTargetSpeedsToPoints(prev, activeTrack.id, speedTargets);
+        count = res.updatedCount;
+        return res.doc;
+      });
+      if (count > 0) {
+        showToast(label || `Matched speed on ${count} point${count > 1 ? 's' : ''}`);
+      }
+    },
+    [activeTrack, commitDoc, showToast]
+  );
+
+  const handleFocusPoint = useCallback(
+    (pointId: string, metric?: 'elevation' | 'speed') => {
+      setSelectedPointId(pointId);
+      setFocusPointRequest((prev) => ({
+        pointId,
+        metric,
+        seq: (prev?.seq ?? 0) + 1,
+      }));
+    },
+    []
+  );
+
   const handleJumpToMaxSpeed = useCallback(() => {
     if (stats.pointStats.length < 2) return;
     let best = stats.pointStats[0];
     for (const ps of stats.pointStats) {
       if (ps.speedKmh > best.speedKmh) best = ps;
     }
-    setSelectedPointId(best.point.id);
-    showToast(`Selected max speed point (${best.speedKmh.toFixed(1)} km/h)`);
-  }, [stats.pointStats, showToast]);
+    handleFocusPoint(best.point.id, 'speed');
+    showToast(`Zoomed to max speed point #${best.index + 1} (${best.speedKmh.toFixed(1)} km/h)`);
+  }, [stats.pointStats, handleFocusPoint, showToast]);
 
   const handleRepairTimestamps = useCallback(() => {
     const targetId = activeTrack?.id || doc.tracks[0]?.id;
@@ -1122,6 +1228,7 @@ export function App() {
             setFitTrigger((n) => n + 1);
           }}
           onSelectPoint={setSelectedPointId}
+          onFocusPoint={handleFocusPoint}
           onHoverPoint={setHoveredPointId}
           onUpdatePoint={handleUpdatePoint}
           onDeletePoint={handleDeletePoint}
@@ -1132,10 +1239,18 @@ export function App() {
           onSetTrimRangeStart={setTrimRangeStartId}
           onSetTrimRangeEnd={setTrimRangeEndId}
           onCutRange={handleCutRange}
+          onConnectRange={handleConnectPoints}
+          onJoinSegments={handleJoinSegments}
           onKeepOnlyRange={handleKeepOnlyRange}
           onReverseTrack={handleReverseTrack}
           onSmoothPoint={handleSmoothPoint}
           onFixSpeedSpikes={handleFixSpeedSpikes}
+          onApplyPointSpeeds={handleApplyPointSpeeds}
+          detectedSpikes={detectedSpikes}
+          spikeJumpThresholdKmh={spikeJumpThresholdKmh}
+          spikeMaxCapKmh={spikeMaxCapKmh}
+          onChangeSpikeJumpThreshold={setSpikeJumpThresholdKmh}
+          onChangeSpikeMaxCap={setSpikeMaxCapKmh}
           onJumpToMaxSpeed={handleJumpToMaxSpeed}
           onRepairTimestamps={handleRepairTimestamps}
           onUpdateMetadata={handleUpdateMetadata}
@@ -1156,14 +1271,19 @@ export function App() {
               waypoints={doc.waypoints}
               selectedPointId={selectedPointId}
               hoveredPointId={hoveredPointId}
+              focusPointRequest={focusPointRequest}
               trimRangeIndices={trimRangeIndices}
               terrainElevations={terrainElevations}
               onlyTerrain={onlyTerrain}
               editMode={editMode}
               mapLayer={mapLayer}
+              dragSmoothRadius={dragSmoothRadius}
+              onChangeDragSmoothRadius={setDragSmoothRadius}
               onSelectPoint={setSelectedPointId}
               onHoverPoint={setHoveredPointId}
               onMovePoint={handleMovePoint}
+              onDeletePoint={handleDeletePoint}
+              onConnectPoints={handleConnectPoints}
               onAddPoint={handleAddPoint}
               onAddWaypoint={handleAddWaypoint}
               onChangeEditMode={setEditMode}
@@ -1182,8 +1302,10 @@ export function App() {
             </div>
             <ElevationChart
               pointStats={stats.pointStats}
+              detectedSpikes={detectedSpikes}
               selectedPointId={selectedPointId}
               hoveredPointId={hoveredPointId}
+              focusPointRequest={focusPointRequest}
               trimRangeIndices={trimRangeIndices}
               terrainElevations={terrainElevations}
               isFetchingTerrain={isFetchingTerrain}

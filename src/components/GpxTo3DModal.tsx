@@ -89,6 +89,7 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
     : manualHeightMm;
 
   const [plaquePosition, setPlaquePosition] = useState<PlaquePosition3D>('bottom');
+  const [textRotationDeg, setTextRotationDeg] = useState<number>(0);
 
   // Keychain ring
   const [keychainEnabled, setKeychainEnabled] = useState<boolean>(false);
@@ -227,6 +228,7 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       modelWidthMm,
       modelHeightMm,
       plaquePosition,
+      textRotationDeg,
       keychainEnabled,
       keychainOuterDiameterMm,
       keychainHoleDiameterMm,
@@ -259,6 +261,7 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
       modelWidthMm,
       modelHeightMm,
       plaquePosition,
+      textRotationDeg,
       keychainEnabled,
       keychainOuterDiameterMm,
       keychainHoleDiameterMm,
@@ -1175,6 +1178,59 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
                       value={titleSizeMm}
                       onChange={(e) => setTitleSizeMm(parseFloat(e.target.value))}
                     />
+
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        marginTop: 6,
+                      }}
+                    >
+                      <span style={{ fontSize: '0.74rem', color: '#94a3b8' }}>
+                        Text Rotation (clockwise)
+                      </span>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span className="slider-val">{textRotationDeg}°</span>
+                        {textRotationDeg !== 0 && (
+                          <button
+                            className="btn-secondary-sm"
+                            style={{ padding: '1px 6px', fontSize: '0.7rem' }}
+                            onClick={() => setTextRotationDeg(0)}
+                            title="Reset text rotation"
+                          >
+                            <RotateCcw size={11} />
+                          </button>
+                        )}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={359}
+                      step={1}
+                      value={textRotationDeg}
+                      onChange={(e) => setTextRotationDeg(parseInt(e.target.value, 10))}
+                    />
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(5, 1fr)',
+                        gap: 5,
+                        marginTop: 4,
+                      }}
+                    >
+                      {[0, 45, 90, 135, 180].map((deg) => (
+                        <button
+                          key={deg}
+                          className={`btn-secondary-sm ${textRotationDeg === deg ? 'btn-active' : ''}`}
+                          style={{ padding: '3px 2px', fontSize: '0.72rem', justifyContent: 'center' }}
+                          onClick={() => setTextRotationDeg(deg)}
+                        >
+                          {deg}°
+                        </button>
+                      ))}
+                    </div>
                   </>
                 ) : (
                   <div style={{ fontSize: '0.74rem', color: '#64748b', marginTop: 4, fontStyle: 'italic' }}>
@@ -1274,6 +1330,32 @@ export const GpxTo3DModal: React.FC<GpxTo3DModalProps> = ({
                       />
                     </div>
                   ))}
+                  {/* Ring position presets (angle: 360 = top, clockwise) */}
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(2, 1fr)',
+                      gap: 5,
+                      marginTop: 4,
+                    }}
+                  >
+                    {[
+                      { label: 'Top-Center', deg: 360 },
+                      { label: 'Bottom-Center', deg: 180 },
+                      { label: 'Left-Center', deg: 270 },
+                      { label: 'Right-Center', deg: 90 },
+                    ].map((p) => (
+                      <button
+                        key={p.label}
+                        className={`btn-secondary-sm ${keychainAngleDeg === p.deg ? 'btn-active' : ''}`}
+                        style={{ padding: '3px 2px', fontSize: '0.72rem', justifyContent: 'center' }}
+                        onClick={() => setKeychainAngleDeg(p.deg)}
+                        title={`Set ring position to ${p.deg}°`}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
                 </>
               )}
             </div>

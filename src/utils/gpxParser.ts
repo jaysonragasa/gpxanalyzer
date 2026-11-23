@@ -994,6 +994,211 @@ function cosineWeight(offset: number, radius: number): number {
 }
 
 /**
+ * Moves `pointId` to `(newLat, newLon)`. When `smoothRadius > 0`, neighboring points
+ * within `±smoothRadius` are pulled smoothly using a cosine bell curve so drifted
+ * GPS path segments can be reshaped organically.
+ */
+export function moveTrackPointWithRadius(
+  doc: GpxDocument,
+  trackId: string,
+  pointId: string,
+  newLat: number,
+  newLon: number,
+  smoothRadius = 0
+): GpxDocument {
+  const targetTrack = doc.tracks.find((t) => t.id === trackId);
+  if (!targetTrack) return doc;
+
+  const allPts = targetTrack.segments.flatMap((s) => s.points);
+  const centerIdx = allPts.findIndex((p) => p.id === pointId);
+  if (centerIdx === -1) return doc;
+
+  const oldLat = allPts[centerIdx].lat;
+  const oldLon = allPts[centerIdx].lon;
+  const dLat = newLat - oldLat;
+  const dLon = newLon - oldLon;
+
+  let globalIdx = 0;
+  return {
+    ...doc,
+    tracks: doc.tracks.map((trk) => {
+      if (trk.id !== trackId) return trk;
+      return {
+        ...trk,
+        segments: trk.segments.map((seg) => ({
+          ...seg,
+          points: seg.points.map((pt) => {
+            const idx = globalIdx;
+            globalIdx += 1;
+            const w = cosineWeight(idx - centerIdx, smoothRadius);
+            if (w <= 0) return pt;
+            if (idx === centerIdx) {
+              return { ...pt, lat: newLat, lon: newLon };
+            }
+            return {
+              ...pt,
+              lat: Number((pt.lat + dLat * w).toFixed(7)),
+              lon: Number((pt.lon + dLon * w).toFixed(7)),
+            };
+          }),
+        })),
+      };
+    }),
+  };
+}
+
+/**
+ * Connects two trackpoints `pointAId` and `pointBId` directly:
+ * - Removes any noisy/jumping points strictly between them
+ * - Merges across segment boundaries if A and B were separated by a segment gap
+ * - Optionally subdivides the straight connection with interpolated points
+ */
+export function connectTrackPoints(
+  doc: GpxDocument,
+  trackId: string,
+  pointAId: string,
+  pointBId: string,
+  subdivideStepM = 0
+): { doc: GpxDocument; removedCount: number; insertedCount: number; bridgedGap: boolean } {
+  const targetTrack = doc.tracks.find((t) => t.id === trackId);
+  if (!targetTrack || pointAId === pointBId) {
+    return { doc, removedCount: 0, insertedCount: 0, bridgedGap: false };
+  }
+
+  // Locate segment & local index for both points
+  let loc1: { segIdx: number; ptIdx: number; globalIdx: number } | null = null;
+  let loc2: { segIdx: number; ptIdx: number; globalIdx: number } | null = null;
+  let gIdx = 0;
+
+  for (let s = 0; s < targetTrack.segments.length; s += 1) {
+    const pts = targetTrack.segments[s].points;
+    for (let p = 0; p < pts.length; p += 1) {
+      if (pts[p].id === pointAId) loc1 = { segIdx: s, ptIdx: p, globalIdx: gIdx };
+      if (pts[p].id === pointBId) loc2 = { segIdx: s, ptIdx: p, globalIdx: gIdx };
+      gIdx += 1;
+    }
+  }
+
+  if (!loc1 || !loc2) {
+    return { doc, removedCount: 0, insertedCount: 0, bridgedGap: false };
+  }
+
+  const startLoc = loc1.globalIdx <= loc2.globalIdx ? loc1 : loc2;
+  const endLoc = loc1.globalIdx <= loc2.globalIdx ? loc2 : loc1;
+
+  const ptA = targetTrack.segments[startLoc.segIdx].points[startLoc.ptIdx];
+  const ptB = targetTrack.segments[endLoc.segIdx].points[endLoc.ptIdx];
+
+  const removedCount = Math.max(0, endLoc.globalIdx - startLoc.globalIdx - 1);
+  const bridgedGap = startLoc.segIdx !== endLoc.segIdx;
+
+  // Build optional interpolated bridge points between ptA and ptB
+  const bridgePts: TrackPoint[] = [];
+  if (subdivideStepM > 0) {
+    const distM = haversineDistanceM(ptA.lat, ptA.lon, ptB.lat, ptB.lon);
+    const steps = Math.floor(distM / subdivideStepM);
+    if (steps >= 2) {
+      const tA = ptA.time ? Date.parse(ptA.time) : NaN;
+      const tB = ptB.time ? Date.parse(ptB.time) : NaN;
+      const hasTimes = !Number.isNaN(tA) && !Number.isNaN(tB) && tB > tA;
+
+      for (let k = 1; k < steps; k += 1) {
+        const frac = k / steps;
+        const lat = Number((ptA.lat + (ptB.lat - ptA.lat) * frac).toFixed(7));
+        const lon = Number((ptA.lon + (ptB.lon - ptA.lon) * frac).toFixed(7));
+        const ele =
+          ptA.ele !== undefined && ptB.ele !== undefined
+            ? Number((ptA.ele + (ptB.ele - ptA.ele) * frac).toFixed(2))
+            : ptA.ele ?? ptB.ele;
+        const time = hasTimes ? toStravaIso(tA + (tB - tA) * frac) : ptA.time;
+
+        bridgePts.push({
+          id: nextId('pt'),
+          lat,
+          lon,
+          ele,
+          time,
+        });
+      }
+    }
+  }
+
+  // Reconstruct segments, fusing startLoc.segIdx .. endLoc.segIdx into one connected segment
+  const beforeSegs = targetTrack.segments.slice(0, startLoc.segIdx);
+  const afterSegs = targetTrack.segments.slice(endLoc.segIdx + 1);
+
+  const headPts = targetTrack.segments[startLoc.segIdx].points.slice(0, startLoc.ptIdx + 1);
+  const tailPts = targetTrack.segments[endLoc.segIdx].points.slice(endLoc.ptIdx);
+
+  const fusedSeg: TrackSegment = {
+    id: targetTrack.segments[startLoc.segIdx].id,
+    name: targetTrack.segments[startLoc.segIdx].name || targetTrack.name,
+    points: [...headPts, ...bridgePts, ...tailPts],
+  };
+
+  const nextSegments = [...beforeSegs, fusedSeg, ...afterSegs].filter((s) => s.points.length > 0);
+
+  return {
+    doc: {
+      ...doc,
+      tracks: doc.tracks.map((trk) =>
+        trk.id === trackId
+          ? {
+              ...trk,
+              segments:
+                nextSegments.length > 0
+                  ? nextSegments
+                  : [{ id: nextId('seg'), name: trk.name, points: [] }],
+            }
+          : trk
+      ),
+    },
+    removedCount,
+    insertedCount: bridgePts.length,
+    bridgedGap,
+  };
+}
+
+/**
+ * Joins all separate segments of a track into a single continuous segment,
+ * removing any visual gaps left by previous cuts or multi-segment imports.
+ */
+export function joinTrackSegments(
+  doc: GpxDocument,
+  trackId: string
+): { doc: GpxDocument; joinedGaps: number } {
+  const targetTrack = doc.tracks.find((t) => t.id === trackId);
+  if (!targetTrack) return { doc, joinedGaps: 0 };
+
+  const nonEmpty = targetTrack.segments.filter((s) => s.points.length > 0);
+  if (nonEmpty.length <= 1) return { doc, joinedGaps: 0 };
+
+  const joinedGaps = nonEmpty.length - 1;
+  const allPts = nonEmpty.flatMap((s) => s.points);
+
+  return {
+    doc: {
+      ...doc,
+      tracks: doc.tracks.map((trk) =>
+        trk.id === trackId
+          ? {
+              ...trk,
+              segments: [
+                {
+                  id: nonEmpty[0].id,
+                  name: trk.name || nonEmpty[0].name,
+                  points: allPts,
+                },
+              ],
+            }
+          : trk
+      ),
+    },
+    joinedGaps,
+  };
+}
+
+/**
  * Adjusts elevation of `pointId` to `newEle`. When `smoothRadius > 0`, neighboring points
  * within `±smoothRadius` follow smoothly using a cosine bell curve.
  */
@@ -1095,7 +1300,7 @@ export function adjustTrackSpeed(
       const oldSpeed = (dist / (dtMs / 1000)) * 3.6;
       const desiredSpeed = Math.max(0.5, oldSpeed + deltaSpeed * w);
       if (dist > 0.1) {
-        dtMs = Math.max(1000, Math.round(((dist / (desiredSpeed / 3.6)) * 1000) / 1000) * 1000);
+        dtMs = Math.max(100, Math.round((dist / (desiredSpeed / 3.6)) * 1000));
       }
     }
 
@@ -1115,11 +1320,208 @@ export function adjustTrackSpeed(
           points: seg.points.map((pt) => {
             const ms = newTimesMs[globalIdx];
             globalIdx += 1;
-            return ms !== null ? { ...pt, time: toStravaIso(ms) } : pt;
+            return ms !== null ? { ...pt, time: new Date(Math.round(ms)).toISOString() } : pt;
           }),
         })),
       };
     }),
+  };
+}
+
+export interface SpeedSpikeAnomaly {
+  index: number;
+  pointId: string;
+  cumulativeDistanceM: number;
+  speedKmh: number;
+  prevCleanIndex: number | null;
+  prevSpeedKmh: number | null;
+  nextCleanIndex: number | null;
+  nextSpeedKmh: number | null;
+  nearestSpeedKmh: number;
+  avgNeighborSpeedKmh: number;
+  jumpKmh: number;
+}
+
+/**
+ * Analyzes track point speeds against their local neighborhood to detect GPS speed spikes.
+ * Identifies points that jump by at least `minJumpKmh` above their surrounding baseline
+ * (or exceed `maxSpeedCapKmh`), and finds the nearest clean before/after neighbor speeds.
+ */
+export function detectSpeedSpikes(
+  pointStats: ComputedPointStats[],
+  minJumpKmh = 10,
+  maxSpeedCapKmh = 45
+): SpeedSpikeAnomaly[] {
+  if (pointStats.length < 3) return [];
+
+  const n = pointStats.length;
+  const windowRadius = 6;
+  const isSpike = new Array<boolean>(n).fill(false);
+
+  // Pass 1: Compare each point against the median of surrounding neighbors
+  for (let i = 1; i < n; i += 1) {
+    const spd = pointStats[i].speedKmh;
+    if (spd <= 0.5) continue;
+
+    if (maxSpeedCapKmh > 0 && spd > maxSpeedCapKmh) {
+      isSpike[i] = true;
+      continue;
+    }
+
+    const neighborSpeeds: number[] = [];
+    const lo = Math.max(1, i - windowRadius);
+    const hi = Math.min(n - 1, i + windowRadius);
+    for (let k = lo; k <= hi; k += 1) {
+      if (k === i) continue;
+      if (pointStats[k].speedKmh > 0.5) {
+        neighborSpeeds.push(pointStats[k].speedKmh);
+      }
+    }
+
+    if (neighborSpeeds.length === 0) continue;
+    neighborSpeeds.sort((a, b) => a - b);
+    const mid = Math.floor(neighborSpeeds.length / 2);
+    const median =
+      neighborSpeeds.length % 2 === 1
+        ? neighborSpeeds[mid]
+        : (neighborSpeeds[mid - 1] + neighborSpeeds[mid]) / 2;
+
+    if (spd - median >= minJumpKmh && spd >= Math.max(6, median * 1.3)) {
+      isSpike[i] = true;
+    }
+  }
+
+  // Pass 2: For each flagged spike, locate nearest clean prev & next neighbor speeds
+  const anomalies: SpeedSpikeAnomaly[] = [];
+  for (let i = 1; i < n; i += 1) {
+    if (!isSpike[i]) continue;
+
+    let prevIdx: number | null = null;
+    for (let p = i - 1; p >= 1; p -= 1) {
+      if (!isSpike[p] && pointStats[p].speedKmh > 0.3) {
+        prevIdx = p;
+        break;
+      }
+    }
+
+    let nextIdx: number | null = null;
+    for (let q = i + 1; q < n; q += 1) {
+      if (!isSpike[q] && pointStats[q].speedKmh > 0.3) {
+        nextIdx = q;
+        break;
+      }
+    }
+
+    const prevSpd = prevIdx !== null ? pointStats[prevIdx].speedKmh : null;
+    const nextSpd = nextIdx !== null ? pointStats[nextIdx].speedKmh : null;
+
+    let nearestSpd = 12;
+    let avgSpd = 12;
+
+    if (prevSpd !== null && nextSpd !== null && prevIdx !== null && nextIdx !== null) {
+      const dPrev = i - prevIdx;
+      const dNext = nextIdx - i;
+      nearestSpd = dPrev < dNext ? prevSpd : dNext < dPrev ? nextSpd : (prevSpd + nextSpd) / 2;
+      const frac = dPrev / (dPrev + dNext);
+      avgSpd = prevSpd + (nextSpd - prevSpd) * frac;
+    } else if (prevSpd !== null) {
+      nearestSpd = prevSpd;
+      avgSpd = prevSpd;
+    } else if (nextSpd !== null) {
+      nearestSpd = nextSpd;
+      avgSpd = nextSpd;
+    }
+
+    anomalies.push({
+      index: i,
+      pointId: pointStats[i].point.id,
+      cumulativeDistanceM: pointStats[i].cumulativeDistanceM,
+      speedKmh: pointStats[i].speedKmh,
+      prevCleanIndex: prevIdx,
+      prevSpeedKmh: prevSpd,
+      nextCleanIndex: nextIdx,
+      nextSpeedKmh: nextSpd,
+      nearestSpeedKmh: Number(Math.max(0.5, nearestSpd).toFixed(2)),
+      avgNeighborSpeedKmh: Number(Math.max(0.5, avgSpd).toFixed(2)),
+      jumpKmh: Number((pointStats[i].speedKmh - avgSpd).toFixed(2)),
+    });
+  }
+
+  return anomalies;
+}
+
+/**
+ * Sets exact target speeds (km/h) for one or more trackpoints by recalculating their
+ * segment durations (dt = dist / targetSpeed) and shifting subsequent timestamps so
+ * all unaffected points keep their exact original speeds.
+ */
+export function applyTargetSpeedsToPoints(
+  doc: GpxDocument,
+  trackId: string,
+  speedTargets: Record<string, number>
+): { doc: GpxDocument; updatedCount: number } {
+  const targetTrack = doc.tracks.find((t) => t.id === trackId);
+  if (!targetTrack) return { doc, updatedCount: 0 };
+
+  const allPts = targetTrack.segments.flatMap((s) => s.points);
+  if (allPts.length < 2) return { doc, updatedCount: 0 };
+
+  const newTimesMs: Array<number | null> = allPts.map((p) =>
+    p.time && !Number.isNaN(Date.parse(p.time)) ? Date.parse(p.time) : null
+  );
+
+  let updatedCount = 0;
+  let curMs = newTimesMs[0];
+
+  for (let i = 1; i < allPts.length; i += 1) {
+    const pt = allPts[i];
+    const prev = allPts[i - 1];
+    const origPrev = prev.time ? Date.parse(prev.time) : NaN;
+    const origCurr = pt.time ? Date.parse(pt.time) : NaN;
+
+    if (curMs === null || Number.isNaN(origPrev) || Number.isNaN(origCurr)) {
+      curMs = newTimesMs[i];
+      continue;
+    }
+
+    let dtMs = Math.max(100, origCurr - origPrev);
+    const targetSpeed = speedTargets[pt.id];
+
+    if (targetSpeed !== undefined && targetSpeed > 0) {
+      const clampedSpeed = Math.max(0.5, Math.min(200, targetSpeed));
+      const dist = haversineDistanceM(prev.lat, prev.lon, pt.lat, pt.lon);
+      if (dist > 0.05) {
+        dtMs = Math.max(100, Math.round((dist / (clampedSpeed / 3.6)) * 1000));
+        updatedCount += 1;
+      }
+    }
+
+    curMs += dtMs;
+    newTimesMs[i] = curMs;
+  }
+
+  if (updatedCount === 0) return { doc, updatedCount: 0 };
+
+  let globalIdx = 0;
+  return {
+    doc: {
+      ...doc,
+      tracks: doc.tracks.map((trk) => {
+        if (trk.id !== trackId) return trk;
+        return {
+          ...trk,
+          segments: trk.segments.map((seg) => ({
+            ...seg,
+            points: seg.points.map((pt) => {
+              const ms = newTimesMs[globalIdx];
+              globalIdx += 1;
+              return ms !== null ? { ...pt, time: new Date(Math.round(ms)).toISOString() } : pt;
+            }),
+          })),
+        };
+      }),
+    },
+    updatedCount,
   };
 }
 

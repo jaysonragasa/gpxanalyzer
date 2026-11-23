@@ -12,12 +12,14 @@ import {
   ZoomOut,
 } from 'lucide-react';
 import { ComputedPointStats } from '../types/gpx';
-import { formatDistance, getGradeColor } from '../utils/gpxParser';
+import { formatDistance, getGradeColor, SpeedSpikeAnomaly } from '../utils/gpxParser';
 
 interface ElevationChartProps {
   pointStats: ComputedPointStats[];
+  detectedSpikes?: SpeedSpikeAnomaly[];
   selectedPointId: string | null;
   hoveredPointId: string | null;
+  focusPointRequest?: { pointId: string; metric?: 'elevation' | 'speed'; seq: number } | null;
   trimRangeIndices?: [number, number] | null;
   terrainElevations?: Record<string, number>;
   isFetchingTerrain?: boolean;
@@ -46,8 +48,10 @@ function cosineWeight(offset: number, radius: number): number {
 
 export const ElevationChart: React.FC<ElevationChartProps> = ({
   pointStats,
+  detectedSpikes = [],
   selectedPointId,
   hoveredPointId,
+  focusPointRequest = null,
   trimRangeIndices = null,
   terrainElevations,
   isFetchingTerrain = false,
@@ -84,6 +88,44 @@ export const ElevationChart: React.FC<ElevationChartProps> = ({
   useEffect(() => {
     setViewRange([0, 1]);
   }, [totalTrackDist]);
+
+  // Zoom & center chart on requested focus point (and switch to requested metric tab)
+  useEffect(() => {
+    if (!focusPointRequest || pointStats.length < 2) return;
+    if (focusPointRequest.metric) {
+      setMetric(focusPointRequest.metric);
+    }
+    const targetIdx = pointStats.findIndex((p) => p.point.id === focusPointRequest.pointId);
+    if (targetIdx === -1) return;
+
+    const totalDist = pointStats[pointStats.length - 1].cumulativeDistanceM || 1;
+    const centerFrac = pointStats[targetIdx].cumulativeDistanceM / totalDist;
+
+    // Frame roughly ±25 neighboring points (clamped between 4% and 20% of total track length)
+    const loIdx = Math.max(0, targetIdx - 25);
+    const hiIdx = Math.min(pointStats.length - 1, targetIdx + 25);
+    const neighborFracSpan =
+      (pointStats[hiIdx].cumulativeDistanceM - pointStats[loIdx].cumulativeDistanceM) / totalDist;
+    const targetSpan =
+      pointStats.length <= 40 ? 1 : Math.max(0.04, Math.min(0.2, neighborFracSpan || 0.1));
+
+    if (targetSpan >= 0.999) {
+      setViewRange([0, 1]);
+      return;
+    }
+
+    let nextS = centerFrac - targetSpan / 2;
+    let nextE = centerFrac + targetSpan / 2;
+    if (nextS < 0) {
+      nextS = 0;
+      nextE = targetSpan;
+    }
+    if (nextE > 1) {
+      nextE = 1;
+      nextS = 1 - targetSpan;
+    }
+    setViewRange([nextS, nextE]);
+  }, [focusPointRequest?.seq]);
 
   const width = 900;
   const height = 160;
@@ -482,7 +524,7 @@ export const ElevationChart: React.FC<ElevationChartProps> = ({
               className={`chart-tab ${metric === 'speed' ? 'active' : ''}`}
               onClick={() => setMetric('speed')}
             >
-              Speed (km/h)
+              Speed (km/h){detectedSpikes.length > 0 ? ` • ${detectedSpikes.length} spikes` : ''}
             </button>
           </div>
 
@@ -717,6 +759,19 @@ export const ElevationChart: React.FC<ElevationChartProps> = ({
               <path d={chartData.linePath} fill="none" stroke={strokeColor} strokeWidth="2" />
             </>
           )}
+          {!chartData.hidePrimary &&
+            metric === 'speed' &&
+            detectedSpikes.map((sp) => (
+              <circle
+                key={sp.pointId}
+                cx={chartData.toX(sp.cumulativeDistanceM)}
+                cy={chartData.toY(chartData.values[sp.index] ?? sp.speedKmh)}
+                r="4"
+                fill="#f59e0b"
+                stroke="#ffffff"
+                strokeWidth="1.2"
+              />
+            ))}
           {(metric === 'elevation' || chartData.hidePrimary) &&
             chartData.terrainColoredSegments.map((seg, i) => (
               <path

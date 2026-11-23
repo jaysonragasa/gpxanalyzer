@@ -39,6 +39,7 @@ export interface Terrain3DOptions {
   showPlaqueStats?: boolean;
   titleSizeMm: number; // 4 .. 12
   plaquePosition?: PlaquePosition3D;
+  textRotationDeg?: number; // 0 .. 359, clockwise, rotates the plaque text block
   keychainEnabled?: boolean;
   keychainOuterDiameterMm?: number;
   keychainHoleDiameterMm?: number;
@@ -1544,6 +1545,23 @@ export function buildTerrainSceneObjects(
 
   if (linesToRender.length > 0) {
     const textGeom = buildTextGeometry(linesToRender, maxAllowedW, baseZ, 1.2);
+    const textRotDeg = (((opts.textRotationDeg ?? 0) % 360) + 360) % 360;
+    if (textGeom && textRotDeg !== 0) {
+      // Rotate the text block around the plaque centre (clockwise as seen from
+      // above), then shrink it if the rotated block no longer fits the plaque
+      const cy = plaqueYTop - plaqueH / 2;
+      textGeom.translate(0, -cy, 0);
+      textGeom.rotateZ((-textRotDeg * Math.PI) / 180);
+      textGeom.computeBoundingBox();
+      const bb = textGeom.boundingBox!;
+      const fit = Math.min(
+        1,
+        maxAllowedW / Math.max(1e-6, bb.max.x - bb.min.x),
+        (plaqueH - 3) / Math.max(1e-6, bb.max.y - bb.min.y)
+      );
+      if (fit < 1) textGeom.scale(fit, fit, 1);
+      textGeom.translate(0, cy, 0);
+    }
     if (textGeom) {
       if (plaquePos === 'top') {
         // Keep the text upright for a viewer in front: move it to the top plaque unrotated
