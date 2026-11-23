@@ -171,8 +171,8 @@ export const MapEditor: React.FC<MapEditorProps> = ({
     if (!containerRef.current || mapRef.current) return;
 
     const map = L.map(containerRef.current, {
-      center: [37.832, -122.485],
-      zoom: 14,
+      center: [16.4151, 120.5973],
+      zoom: 15,
       zoomControl: true,
     });
 
