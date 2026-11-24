@@ -929,20 +929,20 @@ export function createSampleGpx(): GpxDocument {
 
   return {
     metadata: {
-      name: 'Atok to Baguio',
+      name: 'Sample Track',
       time: '2025-01-04T04:01:31Z',
-      creator: 'StravaGPX',
+      creator: 'GPX Analyzer',
     },
     waypoints: [],
     tracks: [
       {
         id: nextId('trk'),
-        name: 'Atok to Baguio',
+        name: 'Sample Track',
         type: 'cycling',
         segments: [
           {
             id: nextId('seg'),
-            name: 'Atok to Baguio',
+            name: 'Sample Track',
             points,
           },
         ],
